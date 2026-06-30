@@ -16,6 +16,68 @@ import (
 	"github.com/navid-fn/lazyplaner/llm"
 )
 
+var (
+	accent      = lipgloss.Color("205")
+	subtle      = lipgloss.Color("241")
+	errorColor  = lipgloss.Color("196")
+	successColor = lipgloss.Color("82")
+	textColor   = lipgloss.Color("252")
+
+	titleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(accent).
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderBottom(true).
+			BorderForeground(subtle).
+			PaddingBottom(1).
+			MarginBottom(1)
+
+	labelFocused = lipgloss.NewStyle().
+			Foreground(accent).
+			Bold(true)
+
+	labelBlurred = lipgloss.NewStyle().
+			Foreground(subtle)
+
+	submitFocused = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("0")).
+			Background(accent).
+			Padding(0, 2)
+
+	submitBlurred = lipgloss.NewStyle().
+			Foreground(subtle).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(subtle).
+			Padding(0, 1)
+
+	statusStyle = lipgloss.NewStyle().
+			Foreground(successColor).
+			Bold(true)
+
+	errorStyle = lipgloss.NewStyle().
+			Foreground(errorColor).
+			Bold(true)
+
+	helpStyle = lipgloss.NewStyle().
+			Foreground(subtle).
+			MarginTop(1)
+
+	loadingStyle = lipgloss.NewStyle().
+			Foreground(accent).
+			Bold(true)
+
+	panelFocused = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(accent).
+			Padding(0, 1)
+
+	panelBlurred = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(subtle).
+			Padding(0, 1)
+)
+
 type model struct {
 	subjectInput textinput.Model
 	detailInput  textinput.Model
@@ -74,18 +136,32 @@ func (p planItem) FilterValue() string {
 
 func NewModel(store *db.Store, client *llm.Client) model {
 	subjectInput := textinput.New()
-	subjectInput.Placeholder = "Subject"
+	subjectInput.Placeholder = "e.g. Learn Go generics"
 	subjectInput.Focus()
 	subjectInput.CharLimit = 120
 	subjectInput.Width = 50
+	subjectInput.PromptStyle = labelFocused
+	subjectInput.TextStyle = lipgloss.NewStyle().Foreground(textColor)
 
 	detailInput := textinput.New()
-	detailInput.Placeholder = "Detail"
+	detailInput.Placeholder = "e.g. I know basic Go, want to understand type constraints"
 	detailInput.CharLimit = 300
 	detailInput.Width = 50
 
-	plansList := list.New([]list.Item{}, list.NewDefaultDelegate(), 30, 10)
+	delegate := list.NewDefaultDelegate()
+	delegate.Styles.SelectedTitle = delegate.Styles.SelectedTitle.
+		Foreground(accent).
+		BorderLeftForeground(accent)
+	delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.
+		Foreground(lipgloss.Color("243")).
+		BorderLeftForeground(accent)
+
+	plansList := list.New([]list.Item{}, delegate, 30, 10)
 	plansList.Title = "Plans"
+	plansList.Styles.Title = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(accent).
+		MarginLeft(1)
 	plansList.SetShowStatusBar(false)
 	plansList.SetFilteringEnabled(false)
 	plansList.SetShowHelp(false)
@@ -158,21 +234,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	var builder strings.Builder
-	builder.WriteString("LazyPlaner\n\n")
+
+	builder.WriteString(titleStyle.Render("  LazyPlaner"))
+	builder.WriteString("\n")
 	builder.WriteString(m.renderForm())
 	builder.WriteString("\n\n")
 	builder.WriteString(m.renderWindows())
 
 	if m.statusText != "" {
-		builder.WriteString("\n\n")
-		builder.WriteString(m.statusText)
+		builder.WriteString("\n")
+		builder.WriteString(statusStyle.Render("✓ " + m.statusText))
 	}
 	if m.errorText != "" {
-		builder.WriteString("\n\nError: ")
-		builder.WriteString(m.errorText)
+		builder.WriteString("\n")
+		builder.WriteString(errorStyle.Render("✗ " + m.errorText))
 	}
 
-	builder.WriteString("\n\nTab/Shift+Tab to change focus. Press q to quit. With Plans focused, press e to edit.\n")
+	builder.WriteString("\n")
+	builder.WriteString(helpStyle.Render("Tab/Shift+Tab · navigate   Enter · submit   e · edit plan   q · quit"))
 	return builder.String()
 }
 
@@ -329,20 +408,24 @@ func (m model) handleEditStart() (tea.Model, tea.Cmd) {
 
 func (m model) renderForm() string {
 	var builder strings.Builder
-	subjectLabel := "Subject:"
-	detailLabel := "Detail:"
-	submitLabel := "[ Submit ]"
+
+	subjectLabel := labelBlurred.Render("Subject")
+	detailLabel := labelBlurred.Render("Detail")
 	if m.focusIndex == 0 {
-		subjectLabel = "> Subject:"
+		subjectLabel = labelFocused.Render("Subject")
 	}
 	if m.focusIndex == 1 {
-		detailLabel = "> Detail:"
+		detailLabel = labelFocused.Render("Detail")
 	}
-	if m.focusIndex == 2 {
-		submitLabel = "> [ Submit ]"
-	}
-	if m.isLoading {
-		submitLabel = "Generating plan..."
+
+	var submitBtn string
+	switch {
+	case m.isLoading:
+		submitBtn = loadingStyle.Render("⠋ Generating plan…")
+	case m.focusIndex == 2:
+		submitBtn = submitFocused.Render("Submit")
+	default:
+		submitBtn = submitBlurred.Render("Submit")
 	}
 
 	builder.WriteString(subjectLabel)
@@ -353,31 +436,33 @@ func (m model) renderForm() string {
 	builder.WriteString("\n")
 	builder.WriteString(m.detailInput.View())
 	builder.WriteString("\n\n")
-	builder.WriteString(submitLabel)
+	builder.WriteString(submitBtn)
 	return builder.String()
 }
 
 func (m model) renderWindows() string {
 	planWidth, detailWidth := m.windowSizes()
-	planStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1).Width(planWidth)
-	detailStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1).Width(detailWidth)
 
-	plansView := m.plansList.View()
+	plansStyle := panelBlurred.Width(planWidth)
+	detailStyle := panelBlurred.Width(detailWidth)
+
 	if m.focusIndex == 3 {
-		planStyle = planStyle.BorderForeground(lipgloss.Color("205"))
+		plansStyle = panelFocused.Width(planWidth)
 	}
 	if m.isEditing {
-		detailStyle = detailStyle.BorderForeground(lipgloss.Color("205"))
+		detailStyle = panelFocused.Width(detailWidth)
 	}
 
-	plansWindow := planStyle.Render(plansView)
+	plansWindow := plansStyle.Render(m.plansList.View())
 	detailWindow := detailStyle.Render(m.renderDetailWindow())
 	return lipgloss.JoinHorizontal(lipgloss.Top, plansWindow, detailWindow)
 }
 
 func (m model) renderDetailWindow() string {
 	if m.isEditing {
-		return "Editing in external editor...\n\nReturn here when you save and close the editor."
+		return lipgloss.NewStyle().Foreground(accent).Bold(true).Render("Editing in external editor…") +
+			"\n\n" +
+			lipgloss.NewStyle().Foreground(subtle).Render("Return here when you save and close the editor.")
 	}
 	return m.currentPlanDescription()
 }
@@ -386,13 +471,13 @@ func (m model) currentPlanDescription() string {
 	plan, ok := m.currentPlan()
 	if !ok {
 		if len(m.plansByID) == 0 {
-			return "Select a plan to see its description."
+			return lipgloss.NewStyle().Foreground(subtle).Render("No plans yet. Create one above.")
 		}
-		return "No plan selected."
+		return lipgloss.NewStyle().Foreground(subtle).Render("No plan selected.")
 	}
 
 	if strings.TrimSpace(plan.Description) == "" {
-		return "No description available."
+		return lipgloss.NewStyle().Foreground(subtle).Render("No description available.")
 	}
 
 	return plan.Description
