@@ -1,3 +1,4 @@
+// Package db stores plans in a local SQLite database.
 package db
 
 import (

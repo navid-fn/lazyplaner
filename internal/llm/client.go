@@ -1,3 +1,4 @@
+// Package llm talks to a local Ollama server to list models and generate plans.
 package llm
 
 import (
@@ -7,14 +8,18 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Client struct {
 	baseURL    string
-	model      string
 	httpClient *http.Client
+
+	mu    sync.RWMutex
+	model string
 }
 
 func NewClient(baseURL string, model string) *Client {
@@ -36,6 +41,61 @@ func NewClient(baseURL string, model string) *Client {
 	}
 }
 
+// Model returns the currently selected model name.
+func (c *Client) Model() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.model
+}
+
+// SetModel changes the model used for subsequent requests.
+func (c *Client) SetModel(model string) {
+	trimmed := strings.TrimSpace(model)
+	if trimmed == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.model = trimmed
+}
+
+// ListModels queries the local Ollama instance for installed models.
+func (c *Client) ListModels(ctx context.Context) ([]string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/tags", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("ollama error: %s", response.Status)
+	}
+
+	var result struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	names := make([]string, 0, len(result.Models))
+	for _, m := range result.Models {
+		if m.Name != "" {
+			names = append(names, m.Name)
+		}
+	}
+	sort.Strings(names)
+
+	return names, nil
+}
+
 func (c *Client) GenerateDescription(ctx context.Context, subject string, detail string) (string, error) {
 	trimmedSubject := strings.TrimSpace(subject)
 	trimmedDetail := strings.TrimSpace(detail)
@@ -55,7 +115,7 @@ func (c *Client) GenerateDescription(ctx context.Context, subject string, detail
 		System string `json:"system"`
 		Stream bool   `json:"stream"`
 	}{
-		Model:  c.model,
+		Model:  c.Model(),
 		Prompt: prompt,
 		System: "You are a helpful planner. Respond with markdown only.",
 		Stream: false,

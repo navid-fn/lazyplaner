@@ -5,27 +5,23 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/navid-fn/lazyplaner/db"
-	"github.com/navid-fn/lazyplaner/llm"
-	"github.com/navid-fn/lazyplaner/ui"
+	"github.com/navid-fn/lazyplaner/internal/config"
+	"github.com/navid-fn/lazyplaner/internal/db"
+	"github.com/navid-fn/lazyplaner/internal/llm"
+	"github.com/navid-fn/lazyplaner/internal/ui"
 )
 
 func main() {
-	dbPath := os.Getenv("LAZYPLANER_DB_PATH")
-	if dbPath == "" {
-		dbPath = "./lazyplaner.db"
-	}
+	cfg := config.Load()
 
-	store, err := db.NewStore(dbPath)
+	store, err := db.NewStore(cfg.DBPath)
 	if err != nil {
 		fmt.Printf("Failed to open database: %v\n", err)
 		os.Exit(1)
 	}
 	defer store.Close()
 
-	ollamaBaseURL := os.Getenv("OLLAMA_BASE_URL")
-	ollamaModel := os.Getenv("OLLAMA_MODEL")
-	client := llm.NewClient(ollamaBaseURL, ollamaModel)
+	client := llm.NewClient(cfg.OllamaBaseURL, cfg.OllamaModel)
 
 	p := tea.NewProgram(
 		ui.NewModel(store, client),
