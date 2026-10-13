@@ -84,9 +84,10 @@ func (m model) handleEditorFinished(msg editorFinishedMsg) (tea.Model, tea.Cmd) 
 		return m, nil
 	}
 	m.isLoading = true
+	m.loadingText = "Saving description…"
 	m.errorText = ""
 	m.statusText = ""
-	return m, updateDescriptionCmd(m.store, m.editPlanID, trimmed)
+	return m, tea.Batch(m.spinner.Tick, updateDescriptionCmd(m.store, m.editPlanID, trimmed))
 }
 
 func (m model) readEditedDescription() (string, error) {

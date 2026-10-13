@@ -26,6 +26,11 @@ type planUpdatedMsg struct {
 	err  error
 }
 
+type planDeletedMsg struct {
+	id  int64
+	err error
+}
+
 type editorFinishedMsg struct {
 	err error
 }

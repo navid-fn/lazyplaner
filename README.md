@@ -17,6 +17,21 @@ Settings come from environment variables (see `internal/config`):
 | `OLLAMA_BASE_URL`  | `http://localhost:11434` |
 | `OLLAMA_MODEL`     | `llama3.2`               |
 
+## Keys
+
+| Key        | Action                                  |
+|------------|-----------------------------------------|
+| `ctrl+n`   | New plan (subject and description)      |
+| `ctrl+o`   | Select the model used for generation    |
+| `e`        | Edit the selected plan in `$EDITOR`     |
+| `d`        | Delete the selected plan (asks `y` to confirm) |
+| `↑` / `↓`  | Move through the plan list              |
+| `q`        | Quit                                    |
+
+In the New Plan window: `tab` switches fields, `enter` moves from subject to
+description, `ctrl+s` generates the plan, and `esc` cancels. In the model
+picker: `enter` selects, `r` refreshes, and `esc` closes.
+
 ## Project layout
 
 ```
@@ -27,8 +42,9 @@ internal/llm/            Ollama HTTP client (list models, generate description)
 internal/ui/             Bubble Tea interface
   model.go               Model state, constructor, Init/Update dispatch
   messages.go            Async result messages (loaded, saved, updated, editor done)
-  keys.go                Keyboard and mouse input
-  focus.go               Moving focus between panels
+  keys.go                Key handling for the plan list
+  newplan.go             New Plan window (subject, description, submit)
+  modelpicker.go         Model picker window
   actions.go             Submit a plan, select a model
   editor.go              Edit a plan description in $VISUAL/$EDITOR
   commands.go            tea.Cmd wrappers that call db and llm off the UI loop

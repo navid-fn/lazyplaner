@@ -2,10 +2,16 @@ package ui
 
 import (
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/navid-fn/lazyplaner/internal/db"
 )
+
+// formatPlanDate shows a plan's creation time in local time.
+func formatPlanDate(t time.Time) string {
+	return t.Local().Format("2006-01-02 15:04")
+}
 
 func (m *model) setPlans(plans []db.Plan) {
 	items := make([]list.Item, 0, len(plans))
@@ -13,7 +19,11 @@ func (m *model) setPlans(plans []db.Plan) {
 	m.plans = plans
 	for _, plan := range plans {
 		m.plansByID[plan.ID] = plan
-		items = append(items, planItem{id: plan.ID, subject: plan.Subject})
+		items = append(items, planItem{
+			id:      plan.ID,
+			subject: plan.Subject,
+			created: formatPlanDate(plan.CreatedAt),
+		})
 	}
 	m.plansList.SetItems(items)
 	if len(items) > 0 {
@@ -54,6 +64,26 @@ func (m *model) setModels(models []string) {
 	m.modelsList.SetItems(items)
 	if len(items) > 0 {
 		m.modelsList.Select(selectedIdx)
+	}
+}
+
+// removePlan drops a plan from the list and keeps the selection on a
+// neighbouring row.
+func (m *model) removePlan(id int64) {
+	kept := make([]db.Plan, 0, len(m.plans))
+	selected := m.plansList.Index()
+	removedAt := -1
+	for i, p := range m.plans {
+		if p.ID == id {
+			removedAt = i
+			continue
+		}
+		kept = append(kept, p)
+	}
+	m.setPlans(kept)
+	if removedAt >= 0 && len(kept) > 0 {
+		// Keep the cursor where it was, clamped to the last row.
+		m.plansList.Select(min(selected, len(kept)-1))
 	}
 }
 

@@ -5,10 +5,11 @@ package ui
 type planItem struct {
 	id      int64
 	subject string
+	created string
 }
 
 func (p planItem) Title() string       { return p.subject }
-func (p planItem) Description() string { return "" }
+func (p planItem) Description() string { return p.created }
 func (p planItem) FilterValue() string { return p.subject }
 
 // ─── Model list item ─────────────────────────────────────────────────────────

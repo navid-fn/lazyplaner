@@ -1,15 +1,21 @@
 package ui
 
-// formPanelH is the fixed outer height of the "New Plan" panel:
-// 7 content lines + 2 border lines.
-const formPanelH = 9
-
-// modelPanelH is the fixed outer height of the "Model" panel.
-const modelPanelH = 7
-
-// bottomBarH is the number of lines the bottom bar occupies.
+// bottomBarH is the number of lines the footer takes: status, separator, keys.
 const bottomBarH = 3
 
+// Outer heights (borders included) of the centered windows.
+const (
+	newPlanPanelH = 16
+	newPlanTextH  = 8
+	modelPanelH   = 14
+)
+
+// bodyHeight is the number of lines above the footer.
+func (m model) bodyHeight() int {
+	return max(m.height-bottomBarH, 3)
+}
+
+// columnWidths returns the plan list width and the preview width.
 func (m model) columnWidths() (int, int) {
 	if m.width == 0 {
 		return 38, 62
@@ -24,36 +30,32 @@ func (m model) columnWidths() (int, int) {
 	return left, m.width - left
 }
 
+// newPlanSize returns the outer size of the New Plan window.
+func (m model) newPlanSize() (int, int) {
+	return clamp(m.width-6, 40, 72), min(newPlanPanelH, m.bodyHeight())
+}
+
+// modelPanelSize returns the outer size of the model picker window.
+func (m model) modelPanelSize() (int, int) {
+	return clamp(m.width-6, 30, 50), min(modelPanelH, m.bodyHeight())
+}
+
+func clamp(v, lo, hi int) int {
+	return min(max(v, lo), hi)
+}
+
+// updateSizes resizes every component to match the current terminal size.
 func (m *model) updateSizes() {
 	leftW, _ := m.columnWidths()
+	bodyH := m.bodyHeight()
+	m.plansList.SetSize(max(leftW-2, 10), max(bodyH-2, 2))
 
-	// Resize text inputs to fit the form panel. The inputs draw a 2-cell
-	// prompt ("> ") and a cursor cell on top of Width, so reserve room for
-	// both inside the panel's inner width (leftW-2).
-	inputW := leftW - 5
-	if inputW < 15 {
-		inputW = 15
-	}
-	m.subjectInput.Width = inputW
-	m.detailInput.Width = inputW
+	formW, _ := m.newPlanSize()
+	// The subject input draws a 2-cell prompt and a cursor cell on top of
+	// Width, so reserve room for both inside the window's inner width.
+	m.newPlan.subject.Width = max(formW-7, 15)
+	m.newPlan.description.SetWidth(max(formW-4, 15))
 
-	// Resize the models list to fit the model panel.
-	modelInnerW := leftW - 2
-	modelInnerH := modelPanelH - 2
-	if modelInnerH < 2 {
-		modelInnerH = 2
-	}
-	m.modelsList.SetSize(modelInnerW, modelInnerH)
-
-	// Resize the plans list to fit the list panel.
-	listPanelH := m.height - bottomBarH - formPanelH - modelPanelH
-	if listPanelH < 4 {
-		listPanelH = 4
-	}
-	listInnerW := leftW - 2
-	listInnerH := listPanelH - 2
-	if listInnerH < 2 {
-		listInnerH = 2
-	}
-	m.plansList.SetSize(listInnerW, listInnerH)
+	pickW, pickH := m.modelPanelSize()
+	m.modelsList.SetSize(max(pickW-2, 10), max(pickH-2, 2))
 }

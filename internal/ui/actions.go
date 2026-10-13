@@ -8,10 +8,10 @@ import (
 )
 
 func (m model) handleSubmit() (tea.Model, tea.Cmd) {
-	subject := strings.TrimSpace(m.subjectInput.Value())
-	detail := strings.TrimSpace(m.detailInput.Value())
+	subject := strings.TrimSpace(m.newPlan.subject.Value())
+	detail := strings.TrimSpace(m.newPlan.description.Value())
 	if subject == "" || detail == "" {
-		m.errorText = "Subject and detail are required."
+		m.errorText = "Subject and description are required."
 		return m, nil
 	}
 	if m.client == nil || m.store == nil {
@@ -19,9 +19,10 @@ func (m model) handleSubmit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.isLoading = true
+	m.loadingText = fmt.Sprintf("Generating plan with %s…", m.selectedModel)
 	m.statusText = ""
 	m.errorText = ""
-	return m, generatePlanCmd(m.client, m.store, subject, detail)
+	return m, tea.Batch(m.spinner.Tick, generatePlanCmd(m.client, m.store, subject, detail))
 }
 
 func (m model) handleSelectModel() (tea.Model, tea.Cmd) {
@@ -42,6 +43,7 @@ func (m model) handleSelectModel() (tea.Model, tea.Cmd) {
 	m.selectedModel = mi.name
 	m.errorText = ""
 	m.statusText = fmt.Sprintf("Model set to %s.", mi.name)
+	m.screen = m.prevScreen
 	m.setModels(m.models)
 	return m, nil
 }

@@ -121,6 +121,22 @@ func (s *Store) ListPlans(ctx context.Context) ([]Plan, error) {
 	return plans, nil
 }
 
+// DeletePlan removes a plan by ID. It returns an error if no plan has that ID.
+func (s *Store) DeletePlan(ctx context.Context, id int64) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM plans WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete plan: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check delete: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("plan %d not found", id)
+	}
+	return nil
+}
+
 func (s *Store) UpdatePlanDescription(ctx context.Context, id int64, description string) (Plan, error) {
 	if id == 0 {
 		return Plan{}, fmt.Errorf("invalid plan id")

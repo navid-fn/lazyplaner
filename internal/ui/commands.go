@@ -44,6 +44,15 @@ func generatePlanCmd(client *llm.Client, store *db.Store, subject, detail string
 	}
 }
 
+func deletePlanCmd(store *db.Store, id int64) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := store.DeletePlan(ctx, id)
+		return planDeletedMsg{id: id, err: err}
+	}
+}
+
 func updateDescriptionCmd(store *db.Store, id int64, description string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
