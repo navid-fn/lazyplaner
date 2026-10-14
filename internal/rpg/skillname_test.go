@@ -38,3 +38,22 @@ func TestValidateSkillName(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeSkillName(t *testing.T) {
+	cases := map[string]string{
+		"python":               "Python",
+		"  public   speaking ": "Public Speaking",
+		"SQL":                  "SQL",
+		"CI/CD":                "CI/CD",
+		"iOS":                  "iOS",
+		"c++":                  "C++",
+		"node.js":              "Node.js",
+		"3d modelling":         "3d Modelling",
+		"édition":              "Édition",
+	}
+	for in, want := range cases {
+		if got := NormalizeSkillName(in); got != want {
+			t.Errorf("NormalizeSkillName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

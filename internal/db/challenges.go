@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
 
 // dayLayout is the format of Challenge.Day. Local dates keep "today" aligned
@@ -17,9 +19,12 @@ func Today() string {
 	return time.Now().Format(dayLayout)
 }
 
-// Challenge is one daily task. Done is true once it has been ticked off.
+// Challenge is one daily directive. Done is true once it has been ticked
+// off. Tier is its slot in the day's set; rpg.TierNone for directives made
+// before tiers existed.
 type Challenge struct {
 	ID          int64
+	Tier        rpg.Tier
 	Day         string
 	SkillName   string
 	Category    string
@@ -35,6 +40,7 @@ type Challenge struct {
 // NewChallenge is a challenge to save. Skill and node are matched by name.
 // An empty node name leaves the challenge attached to the skill only.
 type NewChallenge struct {
+	Tier        rpg.Tier
 	SkillName   string
 	NodeName    string
 	Title       string
@@ -52,8 +58,26 @@ type ChallengeStats struct {
 	Streak int // consecutive days with at least one completed challenge
 }
 
-// SaveChallenges stores the challenges for a day in one transaction. Skill
-// names must already exist.
+var (
+	// ErrDaySet is returned when a day that already has its set is given
+	// another one. A day gets one set; single directives are rerolled
+	// instead.
+	ErrDaySet = errors.New("today's directives are already set")
+	// ErrSetUnfinished is returned when the bonus is asked for before every
+	// directive in the day's set is done.
+	ErrSetUnfinished = errors.New("finish today's directives first")
+	// ErrBonusUsed is returned when the day's one bonus directive has
+	// already been taken.
+	ErrBonusUsed = errors.New("today's bonus directive is already used")
+	// ErrNodeHasDirective is returned when a node already has a directive
+	// today.
+	ErrNodeHasDirective = errors.New("this node already has a directive today")
+)
+
+// SaveChallenges stores the set for a day in one transaction. Skill names
+// must already exist. A day gets one set: it fails with ErrDaySet if the day
+// already has directives, apart from focus directives asked for from the
+// skill tree, which do not count as a set.
 func (s *Store) SaveChallenges(ctx context.Context, day string, items []NewChallenge) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -61,46 +85,176 @@ func (s *Store) SaveChallenges(ctx context.Context, day string, items []NewChall
 	}
 	defer tx.Rollback()
 
-	// A new set for the day is the next batch number.
-	var batch int
+	var existing int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(batch), 0) + 1 FROM challenges WHERE day = ?`, day,
-	).Scan(&batch); err != nil {
-		return fmt.Errorf("next batch: %w", err)
+		`SELECT COUNT(*) FROM challenges WHERE day = ? AND tier != ?`, day, int(rpg.TierFocus),
+	).Scan(&existing); err != nil {
+		return fmt.Errorf("count day: %w", err)
+	}
+	if existing > 0 {
+		return ErrDaySet
+	}
+	batch, err := currentBatch(ctx, tx, day)
+	if err != nil {
+		return err
 	}
 
 	for _, c := range items {
-		var skillID int64
-		if err := tx.QueryRowContext(ctx,
-			`SELECT id FROM skills WHERE name = ?`, c.SkillName,
-		).Scan(&skillID); err != nil {
-			return fmt.Errorf("skill %q: %w", c.SkillName, err)
-		}
-
-		var nodeID int64
-		if c.NodeName != "" {
-			// An unknown node is saved without one rather than failing.
-			_ = tx.QueryRowContext(ctx,
-				`SELECT id FROM skill_nodes WHERE skill_id = ? AND name = ?`, skillID, c.NodeName,
-			).Scan(&nodeID)
-		}
-
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO challenges (day, batch, skill_id, node_id, title, description, difficulty, minutes, xp)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			day, batch, skillID, nodeID, c.Title, c.Description, c.Difficulty, c.Minutes, c.XP,
-		); err != nil {
-			return fmt.Errorf("insert challenge: %w", err)
+		if err := insertChallengeTx(ctx, tx, day, batch, c); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// RerollChallenge replaces one unfinished directive with c, in place, so it
+// keeps its spot in the list. A finished directive cannot be rerolled.
+func (s *Store) RerollChallenge(ctx context.Context, id int64, c NewChallenge) error {
+	skillID, nodeID, err := resolveTarget(ctx, s.db, c)
+	if err != nil {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE challenges SET tier = ?, skill_id = ?, node_id = ?, title = ?, description = ?,
+		        difficulty = ?, minutes = ?, xp = ?
+		 WHERE id = ? AND done_at IS NULL`,
+		int(c.Tier), skillID, nodeID, c.Title, c.Description, c.Difficulty, c.Minutes, c.XP, id,
+	)
+	if err != nil {
+		return fmt.Errorf("reroll challenge: %w", err)
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return fmt.Errorf("challenge %d is done or missing", id)
+	}
+	return nil
+}
+
+// AddBonusChallenge adds the day's one bonus directive, as rpg.TierOvertime,
+// to the end of the day's set. It needs every directive in the set done
+// (ErrSetUnfinished) and works once per day (ErrBonusUsed).
+func (s *Store) AddBonusChallenge(ctx context.Context, day string, c NewChallenge) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	batch, err := currentBatch(ctx, tx, day)
+	if err != nil {
+		return err
+	}
+	var total, done, bonus int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(done_at IS NOT NULL), 0), COALESCE(SUM(tier = ?), 0)
+		 FROM challenges WHERE day = ? AND batch = ?`, int(rpg.TierOvertime), day, batch,
+	).Scan(&total, &done, &bonus); err != nil {
+		return fmt.Errorf("count day: %w", err)
+	}
+	switch {
+	case total == 0 || done < total:
+		return ErrSetUnfinished
+	case bonus > 0:
+		return ErrBonusUsed
+	}
+
+	c.Tier = rpg.TierOvertime
+	if err := insertChallengeTx(ctx, tx, day, batch, c); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// AddNodeChallenge adds a focus directive for one node, as rpg.TierFocus,
+// to today's list. Each node gets at most one directive a day: it fails with
+// ErrNodeHasDirective otherwise. c must name the node.
+func (s *Store) AddNodeChallenge(ctx context.Context, day string, c NewChallenge) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, nodeID, err := resolveTarget(ctx, tx, c)
+	if err != nil {
+		return err
+	}
+	if nodeID == 0 {
+		return fmt.Errorf("node %q of %s not found", c.NodeName, c.SkillName)
+	}
+	var existing int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM challenges WHERE day = ? AND node_id = ?`, day, nodeID,
+	).Scan(&existing); err != nil {
+		return fmt.Errorf("count node: %w", err)
+	}
+	if existing > 0 {
+		return ErrNodeHasDirective
+	}
+	batch, err := currentBatch(ctx, tx, day)
+	if err != nil {
+		return err
+	}
+
+	c.Tier = rpg.TierFocus
+	if err := insertChallengeTx(ctx, tx, day, batch, c); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// currentBatch is the batch today's list is shown from (the newest), or 1
+// for a day with nothing yet.
+func currentBatch(ctx context.Context, tx *sql.Tx, day string) (int, error) {
+	var batch int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(batch), 1) FROM challenges WHERE day = ?`, day,
+	).Scan(&batch); err != nil {
+		return 0, fmt.Errorf("current batch: %w", err)
+	}
+	return batch, nil
+}
+
+// querier is what both *sql.DB and *sql.Tx offer for single-row reads.
+type querier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// resolveTarget looks up the skill and node a challenge names. An unknown
+// node gives node ID 0 rather than failing.
+func resolveTarget(ctx context.Context, q querier, c NewChallenge) (skillID, nodeID int64, err error) {
+	if err := q.QueryRowContext(ctx,
+		`SELECT id FROM skills WHERE name = ?`, c.SkillName,
+	).Scan(&skillID); err != nil {
+		return 0, 0, fmt.Errorf("skill %q: %w", c.SkillName, err)
+	}
+	if c.NodeName != "" {
+		_ = q.QueryRowContext(ctx,
+			`SELECT id FROM skill_nodes WHERE skill_id = ? AND name = ?`, skillID, c.NodeName,
+		).Scan(&nodeID)
+	}
+	return skillID, nodeID, nil
+}
+
+func insertChallengeTx(ctx context.Context, tx *sql.Tx, day string, batch int, c NewChallenge) error {
+	skillID, nodeID, err := resolveTarget(ctx, tx, c)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO challenges (day, batch, tier, skill_id, node_id, title, description, difficulty, minutes, xp)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		day, batch, int(c.Tier), skillID, nodeID, c.Title, c.Description, c.Difficulty, c.Minutes, c.XP,
+	); err != nil {
+		return fmt.Errorf("insert challenge: %w", err)
+	}
+	return nil
 }
 
 // ListChallenges returns the challenges for one day, in the order they were
 // saved.
 func (s *Store) ListChallenges(ctx context.Context, day string) ([]Challenge, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT c.id, c.day, s.name, s.category, COALESCE(n.name, ''), c.title, c.description,
+		`SELECT c.id, c.tier, c.day, s.name, s.category, COALESCE(n.name, ''), c.title, c.description,
 		        c.difficulty, c.minutes, c.xp, c.done_at IS NOT NULL
 		 FROM challenges c
 		 JOIN skills s ON s.id = c.skill_id
@@ -117,7 +271,7 @@ func (s *Store) ListChallenges(ctx context.Context, day string) ([]Challenge, er
 	var out []Challenge
 	for rows.Next() {
 		var c Challenge
-		if err := rows.Scan(&c.ID, &c.Day, &c.SkillName, &c.Category, &c.NodeName, &c.Title,
+		if err := rows.Scan(&c.ID, &c.Tier, &c.Day, &c.SkillName, &c.Category, &c.NodeName, &c.Title,
 			&c.Description, &c.Difficulty, &c.Minutes, &c.XP, &c.Done); err != nil {
 			return nil, fmt.Errorf("scan challenge: %w", err)
 		}

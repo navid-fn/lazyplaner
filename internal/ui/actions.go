@@ -43,7 +43,7 @@ func (m model) handleSelectModel() (tea.Model, tea.Cmd) {
 	m.selectedModel = mi.name
 	m.errorText = ""
 	m.statusText = fmt.Sprintf("Model set to %s.", mi.name)
-	m.screen = m.prevScreen
+	m.screen = m.modelsReturn
 	m.setModels(m.models)
 	return m, nil
 }

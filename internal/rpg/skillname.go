@@ -58,3 +58,19 @@ func ValidateSkillName(name string, existing []string) error {
 	}
 	return nil
 }
+
+// NormalizeSkillName trims the name, squeezes runs of spaces, and
+// capitalizes the first letter of each word ("public speaking" becomes
+// "Public Speaking"). A word that already has a capital letter is kept as
+// typed, so acronyms and brand spellings survive: "SQL", "CI/CD", "iOS".
+func NormalizeSkillName(name string) string {
+	words := strings.Fields(name)
+	for i, w := range words {
+		if strings.IndexFunc(w, unicode.IsUpper) >= 0 {
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(w)
+		words[i] = string(unicode.ToUpper(r)) + w[size:]
+	}
+	return strings.Join(words, " ")
+}

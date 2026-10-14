@@ -179,147 +179,243 @@ func applyRust(ctx context.Context, store *db.Store, now time.Time) error {
 	return nil
 }
 
-// buildSkillTreesCmd asks the model for a tree for each new start skill and
-// saves them. Trees already saved stay if a later one fails.
-func buildSkillTreesCmd(client *llm.Client, store *db.Store, pending []pendingSkill) tea.Cmd {
+// buildSkillTreeCmd asks the model for the tree of the pending skill at
+// index and saves it. The setup screen starts the next one when this one
+// is done, so it can show which skill is being designed.
+func buildSkillTreeCmd(client *llm.Client, store *db.Store, pending []pendingSkill, index int) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
-			return onboardingDoneMsg{err: errors.New("planner is not configured")}
+			return treeBuiltMsg{index: index, err: errors.New("planner is not configured")}
 		}
-		for i, p := range pending {
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			category, nodes, err := rpg.BuildRoadmap(ctx, client, p.Name, p.Level, p.Goal)
-			cancel()
-			if err != nil {
-				return onboardingDoneMsg{err: err}
-			}
+		p := pending[index]
 
-			roadmap := make([]db.RoadmapNode, 0, len(nodes))
-			for _, n := range nodes {
-				roadmap = append(roadmap, db.RoadmapNode{
-					Parent:        n.Parent,
-					Name:          n.Name,
-					Description:   n.Description,
-					RequiredLevel: n.RequiredLevel,
-					XPNeeded:      rpg.NodeXPNeeded(n.RequiredLevel),
-				})
-			}
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		category, nodes, err := rpg.BuildRoadmap(ctx, client, p.Name, p.Level, p.Goal)
+		cancel()
+		if err != nil {
+			return treeBuiltMsg{index: index, err: err}
+		}
 
-			saveCtx, saveCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			// The auditor's category was shown on the setup card, so it wins
-			// over the tree's; without an audit, the tree's choice is used.
-			if p.Category != "" {
-				category = p.Category
-			}
-			_, err = store.CreateSkillTree(saveCtx, db.NewSkillTree{
-				Name:       p.Name,
-				Category:   category,
-				StartLevel: p.Level,
-				Rusty:      p.Rusty,
-				Garrisoned: garrisoned(i),
-				Nodes:      roadmap,
+		roadmap := make([]db.RoadmapNode, 0, len(nodes))
+		for _, n := range nodes {
+			roadmap = append(roadmap, db.RoadmapNode{
+				Parent:        n.Parent,
+				Name:          n.Name,
+				Description:   n.Description,
+				RequiredLevel: n.RequiredLevel,
+				XPNeeded:      rpg.NodeXPNeeded(n.RequiredLevel),
 			})
-			saveCancel()
-			if err != nil {
-				return onboardingDoneMsg{err: fmt.Errorf("save %s: %w", p.Name, err)}
-			}
 		}
-		return onboardingDoneMsg{count: len(pending)}
+
+		// The category on the setup card (from the auditor or the
+		// classifier) wins over the tree's; without one, the tree's is used.
+		if p.Category != "" {
+			category = p.Category
+		}
+		saveCtx, saveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer saveCancel()
+		_, err = store.CreateSkillTree(saveCtx, db.NewSkillTree{
+			Name:       p.Name,
+			Category:   category,
+			StartLevel: p.Level,
+			Rusty:      p.Rusty,
+			Garrisoned: p.Frozen,
+			Nodes:      roadmap,
+		})
+		if err != nil {
+			err = fmt.Errorf("save %s: %w", p.Name, err)
+		}
+		return treeBuiltMsg{index: index, err: err}
 	}
 }
 
-// dailyMode says when loadDailyCmd asks the model for a new set.
-type dailyMode int
+// categorizeSkillCmd asks the classifier for a skill's category. Without a
+// model it falls back to the keyword guess.
+func categorizeSkillCmd(client *llm.Client, name string) tea.Cmd {
+	return func() tea.Msg {
+		if client == nil {
+			if cat := rpg.GuessCategory(name); cat != "" {
+				return categoryDoneMsg{name: name, category: cat}
+			}
+			return categoryDoneMsg{name: name, err: errors.New("planner is not configured")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		cat, err := rpg.CategorizeSkill(ctx, client, name)
+		return categoryDoneMsg{name: name, category: cat, err: err}
+	}
+}
+
+// loadDailyCmd reads today's directives and the challenge stats. It never
+// asks the model for anything; dailyJobCmd does that.
+func loadDailyCmd(store *db.Store) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		list, stats, err := readDaily(ctx, store)
+		return challengesLoadedMsg{challenges: list, stats: stats, err: err}
+	}
+}
+
+func readDaily(ctx context.Context, store *db.Store) ([]db.Challenge, db.ChallengeStats, error) {
+	day := db.Today()
+	list, err := store.ListChallenges(ctx, day)
+	if err != nil {
+		return nil, db.ChallengeStats{}, err
+	}
+	stats, err := store.ChallengeStats(ctx, day)
+	return list, stats, err
+}
+
+// dailyJob is what dailyJobCmd asks the model for.
+type dailyJob int
 
 const (
-	dailyLoad   dailyMode = iota // only read today's challenges
-	dailyCreate                  // create a set when today has none
-	dailyRenew                   // create a set when today has none or all are done
+	dailyGenerate dailyJob = iota // today's set, when today has none
+	dailyReroll                   // a fresh directive in place of one open one
+	dailyBonus                    // the day's one bonus, once the set is done
+	dailyNode                     // a focus directive for one tree node
 )
 
-// canRenew reports whether a new set may be made from this list: there is
-// no set yet, or every challenge in the current set is done.
-func canRenew(list []db.Challenge) bool {
+// hasSet reports whether today's set has been generated. Focus directives
+// made from the skill tree are not a set.
+func hasSet(list []db.Challenge) bool {
+	for _, c := range list {
+		if c.Tier != rpg.TierFocus {
+			return true
+		}
+	}
+	return false
+}
+
+// allChallengesDone reports whether every directive in the list is done. An empty list
+// is not done: there is nothing to finish yet.
+func allChallengesDone(list []db.Challenge) bool {
 	for _, c := range list {
 		if !c.Done {
 			return false
 		}
 	}
-	return true
+	return len(list) > 0
 }
 
-// loadDailyCmd returns the challenges for today, creating a new set first
-// when mode allows it. size is the number of challenges for a new set; it is
-// saved as the default for later sets. It is ignored for dailyLoad.
-func loadDailyCmd(client *llm.Client, store *db.Store, mode dailyMode, size int) tea.Cmd {
+// bonusUsed reports whether today's bonus directive has been handed out.
+func bonusUsed(list []db.Challenge) bool {
+	for _, c := range list {
+		if c.Tier == rpg.TierOvertime {
+			return true
+		}
+	}
+	return false
+}
+
+// dailyJobCmd runs one model job on today's directives and returns the
+// updated list. target is the directive to reroll, or for dailyNode names
+// the skill and node; it is ignored otherwise.
+func dailyJobCmd(client *llm.Client, store *db.Store, job dailyJob, target db.Challenge) tea.Cmd {
 	return func() tea.Msg {
-		day := db.Today()
+		note, err := runDailyJob(client, store, job, target)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-
-		list, err := store.ListChallenges(ctx, day)
-		if err != nil {
-			return challengesLoadedMsg{err: err}
+		list, stats, loadErr := readDaily(ctx, store)
+		if err == nil {
+			err = loadErr
 		}
-
-		count, err := store.DailyChallengeCount(ctx)
-		if err != nil {
-			return challengesLoadedMsg{err: err}
-		}
-
-		create := (mode == dailyCreate && len(list) == 0) ||
-			(mode == dailyRenew && canRenew(list))
-		if create {
-			if size > 0 {
-				count = size
-				if err := store.SetDailyChallengeCount(ctx, size); err != nil {
-					return challengesLoadedMsg{err: err}
-				}
-			}
-			list, err = generateDaily(client, store, day, list, count)
-			if err != nil {
-				return challengesLoadedMsg{err: err}
-			}
-		}
-
-		// The model call above can take longer than ctx allows, so the stats
-		// query gets a fresh deadline.
-		statsCtx, cancelStats := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelStats()
-		stats, err := store.ChallengeStats(statsCtx, day)
-		return challengesLoadedMsg{challenges: list, stats: stats, count: count, err: err}
+		return challengesLoadedMsg{challenges: list, stats: stats, note: note, err: err}
 	}
 }
 
-// generateDaily asks the model for a new set for the day. The titles in
-// previous are passed along so the new set does not repeat them.
-func generateDaily(client *llm.Client, store *db.Store, day string, previous []db.Challenge, count int) ([]db.Challenge, error) {
+func runDailyJob(client *llm.Client, store *db.Store, job dailyJob, target db.Challenge) (string, error) {
 	if client == nil {
-		return nil, errors.New("planner is not configured")
+		return "", errors.New("planner is not configured")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
+	day := db.Today()
+	list, err := store.ListChallenges(ctx, day)
+	if err != nil {
+		return "", err
+	}
 	trees, err := store.SkillTrees(ctx)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	if len(trees) == 0 {
-		return nil, errors.New("no skills yet, create your character first")
-	}
-
-	avoid := make([]string, 0, len(previous))
-	for _, c := range previous {
+	outlines := directiveOutlines(trees)
+	avoid := make([]string, 0, len(list))
+	for _, c := range list {
 		avoid = append(avoid, c.Title)
 	}
-	drafts, err := rpg.BuildChallenges(ctx, client, outlinesFrom(trees), count, avoid)
-	if err != nil {
-		return nil, err
-	}
 
+	switch job {
+	case dailyGenerate:
+		if hasSet(list) {
+			return "", nil // already set, maybe from another window
+		}
+		if len(outlines) == 0 {
+			return "", errors.New("no active skills; activate one on the character screen first")
+		}
+		drafts, err := rpg.BuildDirectives(ctx, client, rpg.DailySlots(outlines), nil)
+		if err != nil {
+			return "", err
+		}
+		if err := store.SaveChallenges(ctx, day, newChallenges(drafts)); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%d directives for today.", len(drafts)), nil
+
+	case dailyReroll:
+		drafts, err := rpg.BuildDirectives(ctx, client, []rpg.DirectiveSlot{rerollSlot(target, trees)}, avoid)
+		if err != nil {
+			return "", err
+		}
+		if err := store.RerollChallenge(ctx, target.ID, newChallenges(drafts)[0]); err != nil {
+			return "", err
+		}
+		return "Rerolled: " + drafts[0].Title, nil
+
+	case dailyBonus:
+		if !allChallengesDone(list) {
+			return "", db.ErrSetUnfinished
+		}
+		if bonusUsed(list) {
+			return "", db.ErrBonusUsed
+		}
+		if len(outlines) == 0 {
+			return "", errors.New("no active skills for a bonus directive")
+		}
+		slot := bonusSlot(outlines, list)
+		drafts, err := rpg.BuildDirectives(ctx, client, []rpg.DirectiveSlot{slot}, avoid)
+		if err != nil {
+			return "", err
+		}
+		if err := store.AddBonusChallenge(ctx, day, newChallenges(drafts)[0]); err != nil {
+			return "", err
+		}
+		return "★ Bonus Overtime Directive: " + drafts[0].Title, nil
+
+	case dailyNode:
+		slot, err := nodeSlot(target, trees)
+		if err != nil {
+			return "", err
+		}
+		drafts, err := rpg.BuildDirectives(ctx, client, []rpg.DirectiveSlot{slot}, avoid)
+		if err != nil {
+			return "", err
+		}
+		if err := store.AddNodeChallenge(ctx, day, newChallenges(drafts)[0]); err != nil {
+			return "", err
+		}
+		return "🎯 New directive for " + target.NodeName + ": " + drafts[0].Title, nil
+	}
+	return "", nil
+}
+
+func newChallenges(drafts []rpg.ChallengeDraft) []db.NewChallenge {
 	items := make([]db.NewChallenge, 0, len(drafts))
 	for _, d := range drafts {
 		items = append(items, db.NewChallenge{
+			Tier:        d.Tier,
 			SkillName:   d.Skill,
 			NodeName:    d.Node,
 			Title:       d.Title,
@@ -329,10 +425,96 @@ func generateDaily(client *llm.Client, store *db.Store, day string, previous []d
 			XP:          d.XP,
 		})
 	}
-	if err := store.SaveChallenges(ctx, day, items); err != nil {
-		return nil, err
+	return items
+}
+
+// directiveOutlines is what the model may build directives from: only
+// active skills, and only their open or rusty nodes. Locked and done nodes
+// are left out, so a directive can never target a node the person cannot
+// work on yet.
+func directiveOutlines(trees []db.SkillTree) []rpg.SkillOutline {
+	var out []rpg.SkillOutline
+	for _, t := range trees {
+		if !t.Skill.IsActive {
+			continue
+		}
+		out = append(out, rpg.SkillOutline{
+			Name:  t.Skill.Name,
+			Level: rpg.ProgressFor(t.Skill.TotalXP).Level,
+			Nodes: openNodeNames(t),
+		})
 	}
-	return store.ListChallenges(ctx, day)
+	return out
+}
+
+// openNodeNames lists a tree's open and rusty nodes.
+func openNodeNames(t db.SkillTree) []string {
+	statuses := rpg.NodeStatuses(toTreeNodes(t.Nodes), rpg.ProgressFor(t.Skill.TotalXP).Level)
+	var names []string
+	for _, n := range t.Nodes {
+		if st := statuses[n.ID]; st == rpg.Unlocked || st == rpg.Rusty {
+			names = append(names, n.Name)
+		}
+	}
+	return names
+}
+
+// rerollSlot keeps a directive's tier and skill. It keeps the node too while
+// that node is still open; otherwise any open node of the skill will do.
+func rerollSlot(c db.Challenge, trees []db.SkillTree) rpg.DirectiveSlot {
+	tier := c.Tier
+	if tier == rpg.TierNone {
+		tier = rpg.TierCoreOp
+	}
+	slot := rpg.DirectiveSlot{Tier: tier, Skill: c.SkillName, Level: 1}
+	for _, t := range trees {
+		if t.Skill.Name != c.SkillName {
+			continue
+		}
+		slot.Level = rpg.ProgressFor(t.Skill.TotalXP).Level
+		slot.Nodes = openNodeNames(t)
+		for _, n := range slot.Nodes {
+			if n == c.NodeName {
+				slot.Nodes = []string{n}
+				break
+			}
+		}
+	}
+	return slot
+}
+
+// nodeSlot is a focus slot for exactly one node. The node must be open or
+// rusty right now, so a directive never targets a locked node.
+func nodeSlot(c db.Challenge, trees []db.SkillTree) (rpg.DirectiveSlot, error) {
+	for _, t := range trees {
+		if t.Skill.Name != c.SkillName {
+			continue
+		}
+		for _, n := range openNodeNames(t) {
+			if n == c.NodeName {
+				return rpg.DirectiveSlot{Tier: rpg.TierFocus, Skill: t.Skill.Name,
+					Level: rpg.ProgressFor(t.Skill.TotalXP).Level, Nodes: []string{n}}, nil
+			}
+		}
+		return rpg.DirectiveSlot{}, fmt.Errorf("%s is not open, so it cannot get a directive", c.NodeName)
+	}
+	return rpg.DirectiveSlot{}, fmt.Errorf("skill %s not found", c.SkillName)
+}
+
+// bonusSlot gives the bonus to the active skill with the fewest directives
+// today, the first such skill on a tie.
+func bonusSlot(outlines []rpg.SkillOutline, list []db.Challenge) rpg.DirectiveSlot {
+	count := map[string]int{}
+	for _, c := range list {
+		count[c.SkillName]++
+	}
+	best := outlines[0]
+	for _, o := range outlines[1:] {
+		if count[o.Name] < count[best.Name] {
+			best = o
+		}
+	}
+	return rpg.DirectiveSlot{Tier: rpg.TierOvertime, Skill: best.Name, Level: best.Level, Nodes: best.Nodes}
 }
 
 // completeChallengeCmd ticks a challenge off and awards its XP.

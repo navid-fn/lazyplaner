@@ -2,8 +2,11 @@ package db
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
 
 func seedGoTree(t *testing.T, store *Store) {
@@ -41,8 +44,8 @@ func TestCreateSkillTreeStoresSkillAndNodes(t *testing.T) {
 	if nodes[0].ParentID != 0 || nodes[1].ParentID != nodes[0].ID {
 		t.Errorf("parent links wrong: %+v", nodes)
 	}
-	if nodes[1].XPNeeded != 80 {
-		t.Errorf("default XP cost = %d, want 80", nodes[1].XPNeeded)
+	if nodes[1].XPNeeded != rpg.NodeXPNeeded(2) {
+		t.Errorf("default XP cost = %d, want %d", nodes[1].XPNeeded, rpg.NodeXPNeeded(2))
 	}
 
 	if _, err := store.CreateSkillTree(ctx, NewSkillTree{Name: "go", Category: "Craft"}); err == nil {
@@ -266,46 +269,88 @@ func TestUpdateSkillRejectsClash(t *testing.T) {
 	}
 }
 
-func TestNewBatchReplacesTodaysListButKeepsScore(t *testing.T) {
+func TestADayGetsOneSetAndOneBonus(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
 	seedGoTree(t, store)
 	today := Today()
 
 	if err := store.SaveChallenges(ctx, today, []NewChallenge{
-		{SkillName: "Go", Title: "First set", Difficulty: 1, Minutes: 10, XP: 2},
+		{Tier: rpg.TierRecon, SkillName: "Go", Title: "First", Difficulty: 1, Minutes: 10, XP: 2},
+		{Tier: rpg.TierCoreOp, SkillName: "Go", Title: "Second", Difficulty: 3, Minutes: 30, XP: 9},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	first, _ := store.ListChallenges(ctx, today)
-	if _, err := store.CompleteChallenge(ctx, first[0].ID); err != nil {
+	if err := store.SaveChallenges(ctx, today, []NewChallenge{
+		{SkillName: "Go", Title: "Farm", Difficulty: 1, Minutes: 10, XP: 2},
+	}); !errors.Is(err, ErrDaySet) {
+		t.Fatalf("a second set the same day should fail with ErrDaySet, got %v", err)
+	}
+
+	bonus := NewChallenge{SkillName: "Go", NodeName: "Syntax", Title: "Extra", Difficulty: 3, Minutes: 30, XP: 9}
+	if err := store.AddBonusChallenge(ctx, today, bonus); !errors.Is(err, ErrSetUnfinished) {
+		t.Fatalf("bonus before the set is done: got %v, want ErrSetUnfinished", err)
+	}
+
+	list, _ := store.ListChallenges(ctx, today)
+	if list[0].Tier != rpg.TierRecon || list[1].Tier != rpg.TierCoreOp {
+		t.Errorf("tiers should round-trip, got %v and %v", list[0].Tier, list[1].Tier)
+	}
+	for _, c := range list {
+		if _, err := store.CompleteChallenge(ctx, c.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := store.AddBonusChallenge(ctx, today, bonus); err != nil {
 		t.Fatal(err)
 	}
+	list, _ = store.ListChallenges(ctx, today)
+	if len(list) != 3 || list[2].Tier != rpg.TierOvertime || list[2].NodeName != "Syntax" {
+		t.Fatalf("the bonus should join the end of today's list, got %+v", list)
+	}
+	if _, err := store.CompleteChallenge(ctx, list[2].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddBonusChallenge(ctx, today, bonus); !errors.Is(err, ErrBonusUsed) {
+		t.Fatalf("a second bonus should fail with ErrBonusUsed, got %v", err)
+	}
+
+	st, _ := store.ChallengeStats(ctx, today)
+	if st.Total != 3 || st.Done != 3 || st.Score != 20 {
+		t.Errorf("stats = %+v, want 3/3 done and score 20", st)
+	}
+}
+
+func TestRerollReplacesOnlyAnOpenDirective(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	seedGoTree(t, store)
+	today := Today()
 
 	if err := store.SaveChallenges(ctx, today, []NewChallenge{
-		{SkillName: "Go", Title: "Second set A", Difficulty: 1, Minutes: 10, XP: 3},
-		{SkillName: "Go", Title: "Second set B", Difficulty: 1, Minutes: 10, XP: 3},
+		{Tier: rpg.TierRecon, SkillName: "Go", Title: "Keep", Difficulty: 1, Minutes: 10, XP: 2},
+		{Tier: rpg.TierCoreOp, SkillName: "Go", Title: "Swap", Difficulty: 3, Minutes: 30, XP: 9},
 	}); err != nil {
 		t.Fatal(err)
 	}
+	list, _ := store.ListChallenges(ctx, today)
 
-	list, err := store.ListChallenges(ctx, today)
-	if err != nil {
+	if err := store.RerollChallenge(ctx, list[1].ID, NewChallenge{Tier: rpg.TierCoreOp, SkillName: "Go",
+		NodeName: "Syntax", Title: "Write a table-driven test", Difficulty: 3, Minutes: 40, XP: 12}); err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 2 || list[0].Title != "Second set A" {
-		t.Fatalf("today should show only the latest set, got %+v", list)
+	after, _ := store.ListChallenges(ctx, today)
+	if len(after) != 2 || after[0].Title != "Keep" || after[1].ID != list[1].ID ||
+		after[1].Title != "Write a table-driven test" || after[1].NodeName != "Syntax" || after[1].XP != 12 {
+		t.Fatalf("reroll should replace only the one directive in place, got %+v", after)
 	}
 
-	st, err := store.ChallengeStats(ctx, today)
-	if err != nil {
+	if _, err := store.CompleteChallenge(ctx, list[0].ID); err != nil {
 		t.Fatal(err)
 	}
-	if st.Total != 2 || st.Done != 0 {
-		t.Errorf("stats should describe the latest set, got %+v", st)
-	}
-	if st.Score != 2 {
-		t.Errorf("score should keep the finished challenge from the first set, got %d", st.Score)
+	if err := store.RerollChallenge(ctx, list[0].ID, NewChallenge{SkillName: "Go", Title: "x"}); err == nil {
+		t.Error("a finished directive must not be rerolled")
 	}
 }
 
@@ -329,5 +374,34 @@ func TestChallengeDescriptionIsStoredAndListed(t *testing.T) {
 	}
 	if list[0].Description != "Write a for loop that sums 1 to 10 and prints it." {
 		t.Errorf("description = %q", list[0].Description)
+	}
+}
+
+func TestNodeDirectivesAreOnePerNodeAndNotASet(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	seedGoTree(t, store)
+	today := Today()
+
+	focus := NewChallenge{SkillName: "Go", NodeName: "Interfaces", Title: "Write a Stringer", Difficulty: 3, Minutes: 30, XP: 9}
+	if err := store.AddNodeChallenge(ctx, today, focus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddNodeChallenge(ctx, today, focus); !errors.Is(err, ErrNodeHasDirective) {
+		t.Fatalf("a second directive for the node: got %v, want ErrNodeHasDirective", err)
+	}
+	if err := store.AddNodeChallenge(ctx, today, NewChallenge{SkillName: "Go", Title: "x"}); err == nil {
+		t.Error("a node directive must name a node")
+	}
+
+	// The day's set can still be generated, and both show together.
+	if err := store.SaveChallenges(ctx, today, []NewChallenge{
+		{Tier: rpg.TierRecon, SkillName: "Go", Title: "Recon", Difficulty: 1, Minutes: 10, XP: 2},
+	}); err != nil {
+		t.Fatalf("a focus directive must not block the set: %v", err)
+	}
+	list, _ := store.ListChallenges(ctx, today)
+	if len(list) != 2 || list[0].Tier != rpg.TierFocus || list[1].Tier != rpg.TierRecon {
+		t.Errorf("list = %+v", list)
 	}
 }

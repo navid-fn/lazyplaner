@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // panel draws a rounded box with a title embedded in the top border.
@@ -20,7 +21,8 @@ func panel(title, content string, outerW, outerH int, active bool) string {
 	iH := outerH - 2 // inner height (excludes top/bottom border)
 
 	// ╭─ Title ─────────────────────────╮
-	ts := " " + title + " "
+	// A title too long for the border is clipped, so it can't widen the box.
+	ts := ansi.Truncate(" "+title+" ", max(iW-1, 0), "… ")
 	dash := iW - 1 - lipgloss.Width(ts)
 	if dash < 0 {
 		dash = 0

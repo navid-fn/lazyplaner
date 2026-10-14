@@ -50,10 +50,6 @@ func (m model) handleNewPlanKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case "ctrl+s":
 		return m.handleSubmit()
-	case "ctrl+o":
-		// The form keeps its text while the picker is open. A plan that is
-		// already generating keeps the model it started with.
-		return m.openModels()
 	case "enter":
 		// Enter moves from subject to description; inside the description
 		// it inserts a newline.

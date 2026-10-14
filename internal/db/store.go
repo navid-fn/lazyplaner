@@ -111,7 +111,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	)
 
 	statements = append(statements,
-		// Small key/value store for preferences, such as the daily set size.
+		// Small key/value store for preferences.
 		`CREATE TABLE IF NOT EXISTS settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -135,6 +135,10 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	}
 	// Challenges made before descriptions existed have an empty one.
 	if err := s.addColumnIfMissing(ctx, "challenges", "description", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// A directive's tier (rpg.Tier). Older rows are 0, no tier.
+	if err := s.addColumnIfMissing(ctx, "challenges", "tier", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 

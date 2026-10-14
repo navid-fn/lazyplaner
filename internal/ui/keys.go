@@ -13,6 +13,11 @@ func (m model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.isEditing {
 		return m, nil
 	}
+	// ctrl+o picks the model from anywhere; the picker handles it itself
+	// (it closes the picker).
+	if msg.String() == "ctrl+o" && m.screen != screenModels {
+		return m.openModels()
+	}
 	switch m.screen {
 	case screenNewPlan:
 		return m.handleNewPlanKey(msg)
@@ -24,14 +29,10 @@ func (m model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleOnboardKey(msg)
 	case screenTree:
 		return m.handleTreeKey(msg)
-	case screenDaily:
-		return m.handleDailyKey(msg)
 	case screenHelp:
 		return m.handleHelpKey(msg)
 	case screenSkillEdit:
 		return m.handleSkillEditKey(msg)
-	case screenDailyPick:
-		return m.handleDailyPickKey(msg)
 	}
 	return m.handleMainKey(msg)
 }
@@ -63,8 +64,6 @@ func (m model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+n":
 		cmd := m.openNewPlan()
 		return m, cmd
-	case "ctrl+o":
-		return m.openModels()
 	case "c":
 		cmd := m.openRoad()
 		return m, cmd
@@ -72,10 +71,7 @@ func (m model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openTree()
 		return m, nil
 	case "g":
-		if m.isLoading {
-			return m, nil
-		}
-		cmd := m.openDaily()
+		cmd := m.startDailyJob()
 		return m, cmd
 	case "s":
 		if m.isLoading {

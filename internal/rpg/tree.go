@@ -1,6 +1,9 @@
 package rpg
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // Status is where a skill-tree node stands for the character right now.
 type Status int
@@ -12,18 +15,28 @@ const (
 	Rusty                  // open, but neglected; practising it earns a comeback bonus
 )
 
-// nodeXPPerLevel sets how much XP a node costs, per required level. A
-// level-3 node costs 120 XP.
+// nodeXPPerLevel sets the least XP a node costs, per required level.
 const nodeXPPerLevel = 40
+
+// nodeLevelShare is the least share of a level's climb (the XP from its
+// start to the next level) that one node at that level costs. A fresh tree
+// opens two nodes at a level, so together they cover 120% of the climb and
+// finishing them always reaches the next level.
+const nodeLevelShare = 0.6
 
 // RustAfter is how long an active skill can go without any XP before its
 // frontier node turns rusty.
 const RustAfter = 14 * 24 * time.Hour
 
 // NodeXPNeeded returns the XP needed to finish a node that requires level
-// required.
+// required: 40 per level, but never less than nodeLevelShare of the climb
+// from that level to the next, rounded up. A level-2 node costs 110 XP, as
+// the climb from Lv 2 to Lv 3 is 183 XP.
 func NodeXPNeeded(required int) int {
-	return nodeXPPerLevel * max(required, 1)
+	r := max(required, 1)
+	climb := TotalXPForLevel(r+1) - TotalXPForLevel(r)
+	share := int(math.Ceil(float64(climb) * nodeLevelShare))
+	return max(nodeXPPerLevel*r, share)
 }
 
 // StartProgress is the progress a node starts with when its skill begins at
@@ -55,7 +68,51 @@ type TreeNode struct {
 // Rusty when it has been marked rusty, and Unlocked if neither. nodes must
 // be ordered so that a parent comes before its children, which is the order
 // rows are inserted in.
+//
+// So the person can never be stuck, there is one exception: when no node is
+// open, the next tier (the locked nodes with the lowest requirement whose
+// parent is done) opens even though the skill is short of its level. XP
+// also comes from plans and directives that hit no node, so a skill can
+// finish every open node before it reaches the next level.
 func NodeStatuses(nodes []TreeNode, skillLevel int) map[int64]Status {
+	statuses := strictStatuses(nodes, skillLevel)
+	for _, s := range statuses {
+		if s == Unlocked || s == Rusty {
+			return statuses
+		}
+	}
+
+	next := 0
+	for _, n := range nodes {
+		if statuses[n.ID] == Locked && parentDone(n, statuses) && (next == 0 || n.Required < next) {
+			next = n.Required
+		}
+	}
+	if next == 0 {
+		return statuses // everything is done, or nothing can open
+	}
+	for _, n := range nodes {
+		if statuses[n.ID] == Locked && parentDone(n, statuses) && n.Required == next {
+			switch {
+			case n.Progress >= n.XPNeeded:
+				statuses[n.ID] = Done
+			case n.Rusty:
+				statuses[n.ID] = Rusty
+			default:
+				statuses[n.ID] = Unlocked
+			}
+		}
+	}
+	return statuses
+}
+
+// parentDone reports whether n hangs off the skill or off a done node.
+func parentDone(n TreeNode, statuses map[int64]Status) bool {
+	return n.ParentID == 0 || statuses[n.ParentID] == Done
+}
+
+// strictStatuses applies the level and parent rules with no exception.
+func strictStatuses(nodes []TreeNode, skillLevel int) map[int64]Status {
 	statuses := make(map[int64]Status, len(nodes))
 	for _, n := range nodes {
 		parentDone := true

@@ -27,7 +27,7 @@ Settings come from environment variables (see `internal/config`):
 | `d`        | Delete the selected plan (asks `y` to confirm) |
 | `c`        | Character sheet and road (skills, level, XP history) |
 | `t`        | Skill tree for each skill (←/→ switches skill, `e` edits it) |
-| `g`        | Daily challenges (↑↓ move, enter ticks one off). The first set of the day asks how many (1 to 5); `r` asks again for a new set once all are done |
+| `g`        | Today's directives, in the home panel: generates the day's set (⚡ Recon, 🔧 Core Op, 🔥 Deep Push); once all are done, one ★ bonus per day. `r` rerolls the highlighted open directive, enter completes it |
 | `s`        | Character setup (start skills and levels) |
 | `h`        | Help: what you can type, levels, categories, plans, keys (←/→ switches section) |
 | `↑` / `↓`  | Move through the plan list              |

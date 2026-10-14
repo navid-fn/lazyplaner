@@ -79,7 +79,7 @@ func (m model) handleSkillEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // saveSkillEdit validates the new name and starts the reset.
 func (m model) saveSkillEdit() (tea.Model, tea.Cmd) {
 	f := &m.skillEdit
-	name := strings.TrimSpace(f.name.Value())
+	name := rpg.NormalizeSkillName(f.name.Value())
 
 	// The skill's own name is not a clash, so it is left out of the check.
 	var others []string

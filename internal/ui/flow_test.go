@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/navid-fn/lazyplaner/internal/db"
+	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
 
 func newFlowModel(t *testing.T) model {
@@ -38,6 +39,9 @@ func key(s string) tea.KeyMsg {
 		"down":      tea.KeyDown,
 		"ctrl+s":    tea.KeyCtrlS,
 		"ctrl+d":    tea.KeyCtrlD,
+		"ctrl+r":    tea.KeyCtrlR,
+		"shift+tab": tea.KeyShiftTab,
+		"ctrl+o":    tea.KeyCtrlO,
 		"backspace": tea.KeyBackspace,
 	}
 	if t, ok := named[s]; ok {
@@ -53,9 +57,13 @@ func send(t *testing.T, m model, msg tea.Msg) model {
 	return next.(model)
 }
 
-// tabTo presses tab until the setup form's focus is on field.
+// tabTo moves the setup screen's focus to field: ctrl+r switches between
+// the form and the roster, and tab steps through the form's fields.
 func tabTo(t *testing.T, m model, field onboardField) model {
 	t.Helper()
+	if (field == fieldList) != (m.onboard.field == fieldList) {
+		m = send(t, m, key("ctrl+r"))
+	}
 	for range fieldCount {
 		if m.onboard.field == field {
 			return m
@@ -177,7 +185,7 @@ func TestTreeNavigationCyclesSkills(t *testing.T) {
 
 func TestDailyCursorStaysInRange(t *testing.T) {
 	m := newFlowModel(t)
-	m.screen = screenDaily
+	m.screen = screenMain
 	m.challenges = []db.Challenge{{ID: 1, Title: "a"}, {ID: 2, Title: "b"}}
 
 	for i := 0; i < 5; i++ {
@@ -196,7 +204,7 @@ func TestDailyCursorStaysInRange(t *testing.T) {
 
 func TestDailyTickOffStartsCompletion(t *testing.T) {
 	m := newFlowModel(t)
-	m.screen = screenDaily
+	m.screen = screenMain
 	m.challenges = []db.Challenge{{ID: 1, Title: "Write a loop", XP: 3}}
 
 	m = send(t, m, key("enter"))
@@ -215,7 +223,7 @@ func TestDailyTickOffStartsCompletion(t *testing.T) {
 
 func TestDailyDoesNotTickDoneChallenge(t *testing.T) {
 	m := newFlowModel(t)
-	m.screen = screenDaily
+	m.screen = screenMain
 	m.challenges = []db.Challenge{{ID: 1, Title: "Done already", Done: true}}
 
 	m = send(t, m, key("enter"))
@@ -362,7 +370,7 @@ func TestSetupEditsAStartSkillFromTheList(t *testing.T) {
 	m = typeText(t, m, "Running")
 	m = send(t, m, key("enter"))
 
-	// Tab to the list (name → level → list) and pick the first row.
+	// Tab to the list and pick the first row.
 	m = tabTo(t, m, fieldList)
 	m = send(t, m, key("up"))
 	m = send(t, m, key("up"))
@@ -474,81 +482,99 @@ func TestSkillEditShowsResetWarning(t *testing.T) {
 	}
 }
 
-func TestDailyNewSetOnlyWhenAllDone(t *testing.T) {
+func TestGGeneratesOnlyAnEmptyDay(t *testing.T) {
 	m := newFlowModel(t)
-	m.screen = screenDaily
+	m.mainFocus = focusPlans
 
-	// Still open: r is refused and nothing starts.
+	m = send(t, m, key("g"))
+	if m.dailyBusy == "" || m.mainFocus != focusDirectives {
+		t.Fatalf("g on an empty day should start generating in the directives panel, busy=%q focus=%v",
+			m.dailyBusy, m.mainFocus)
+	}
+	if m.screen != screenMain {
+		t.Errorf("g must not open a popup, screen=%v", m.screen)
+	}
+	if !strings.Contains(m.View(), m.dailyBusy) {
+		t.Error("the directives panel header should show what is being generated")
+	}
+	if strings.Count(m.View(), "Generating") != 1 {
+		t.Errorf("the generating text should show once, not in the panel and the status line: %d", strings.Count(m.View(), "Generating"))
+	}
+
+	m = send(t, m, challengesLoadedMsg{
+		challenges: []db.Challenge{{ID: 1, Tier: rpg.TierRecon, Title: "Sketch 4 eyes"}},
+		note:       "3 directives for today.",
+	})
+	if m.dailyBusy != "" || len(m.challenges) != 1 || m.statusText != "3 directives for today." {
+		t.Errorf("the result should land in the panel: busy=%q n=%d status=%q", m.dailyBusy, len(m.challenges), m.statusText)
+	}
+}
+
+func TestGIsCappedOncePerDay(t *testing.T) {
+	m := newFlowModel(t)
+
+	// Still open: g does not hand out more.
 	m.challenges = []db.Challenge{{ID: 1, Title: "Open"}, {ID: 2, Title: "Done", Done: true}}
-	m = send(t, m, key("r"))
-	if m.isLoading || !strings.Contains(m.statusText, "Finish today's challenges") {
-		t.Errorf("r with open challenges should be refused, loading=%v status=%q", m.isLoading, m.statusText)
+	m = send(t, m, key("g"))
+	if m.dailyBusy != "" || !strings.Contains(m.statusText, "Finish today's directives") {
+		t.Errorf("g with open directives should be refused, busy=%q status=%q", m.dailyBusy, m.statusText)
 	}
 
-	// All done: r starts a new set.
+	// All done: g calls in the one bonus.
 	m.challenges = []db.Challenge{{ID: 1, Title: "Done", Done: true}}
+	if !strings.Contains(m.View(), "Set complete") {
+		t.Error("a finished set should offer the bonus")
+	}
+	m = send(t, m, key("g"))
+	if m.dailyBusy == "" {
+		t.Fatal("g after the set is done should start the bonus")
+	}
+
+	// Bonus taken and done: the day is capped.
+	m.dailyBusy = ""
+	m.challenges = append(m.challenges, db.Challenge{ID: 2, Tier: rpg.TierOvertime, Title: "Extra", Done: true})
+	m = send(t, m, key("g"))
+	if m.dailyBusy != "" || !strings.Contains(m.statusText, "Daily cap reached") {
+		t.Errorf("a second bonus should be refused, busy=%q status=%q", m.dailyBusy, m.statusText)
+	}
+	if !strings.Contains(m.View(), "Daily cap reached") {
+		t.Error("the panel should say the day is capped")
+	}
+}
+
+func TestRRerollsOnlyTheOpenSelectedDirective(t *testing.T) {
+	m := newFlowModel(t)
+	m.challenges = []db.Challenge{{ID: 1, Title: "Done", Done: true}, {ID: 2, Title: "Open"}}
+
 	m = send(t, m, key("r"))
-	if m.screen != screenDailyPick || !m.dailyPickRenew {
-		t.Fatalf("r after all challenges are done should ask how many to make, screen=%v", m.screen)
+	if m.dailyBusy != "" || !strings.Contains(m.statusText, "Only open directives") {
+		t.Errorf("r on a done directive should be refused, busy=%q status=%q", m.dailyBusy, m.statusText)
 	}
-	m = send(t, m, key("enter"))
-	if !m.isLoading {
-		t.Error("confirming the picker should start the new set")
+
+	m = send(t, m, key("down"))
+	m = send(t, m, key("r"))
+	if m.dailyBusy != "Rerolling…" {
+		t.Errorf("r on an open directive should reroll it, busy=%q", m.dailyBusy)
+	}
+	// A second job waits for the first.
+	m.challengeCursor = 0
+	m = send(t, m, key("r"))
+	if m.dailyBusy != "Rerolling…" || m.statusText != "" {
+		t.Errorf("busy = %q", m.dailyBusy)
 	}
 }
 
-func TestDailyRenewHintOnlyWhenAllDone(t *testing.T) {
+func TestDirectiveRowsShowTheirTier(t *testing.T) {
 	m := newFlowModel(t)
-	m.screen = screenDaily
-	m.challenges = []db.Challenge{{ID: 1, Title: "Open"}}
-	if strings.Contains(m.View(), "new set") {
-		t.Error("the new-set key should not show while challenges are open")
+	m.challenges = []db.Challenge{
+		{ID: 1, Tier: rpg.TierRecon, Title: "Sketch eyes", SkillName: "Drawing"},
+		{ID: 2, Tier: rpg.TierDeepPush, Title: "Write a pool", SkillName: "Go"},
 	}
-	m.challenges[0].Done = true
-	if !strings.Contains(m.View(), "new set") {
-		t.Error("the new-set key should show once everything is done")
-	}
-}
-
-func TestDailyPickerSizeAndCancel(t *testing.T) {
-	m := newFlowModel(t)
-	m.screen = screenDaily
-	m.dailyDefault = 3
-	m.openDailyPicker(false)
-	if m.dailyPickSize != 3 {
-		t.Fatalf("picker should start at the default 3, got %d", m.dailyPickSize)
-	}
-
-	for i := 0; i < 5; i++ {
-		m = send(t, m, key("right"))
-	}
-	if m.dailyPickSize != 5 {
-		t.Errorf("size should clamp at 5, got %d", m.dailyPickSize)
-	}
-	for i := 0; i < 9; i++ {
-		m = send(t, m, key("left"))
-	}
-	if m.dailyPickSize != 1 {
-		t.Errorf("size should clamp at 1, got %d", m.dailyPickSize)
-	}
-
-	m = send(t, m, key("esc"))
-	if m.screen != screenDaily || m.isLoading {
-		t.Errorf("esc should go back to the daily popup without generating, screen=%v loading=%v", m.screen, m.isLoading)
-	}
-}
-
-func TestDailyOpensPickerWhenTodayIsEmpty(t *testing.T) {
-	m := newFlowModel(t)
-	m.screen = screenDaily
-	m.dailyOpening = true
-	m.isLoading = true
-	m = send(t, m, challengesLoadedMsg{count: 4})
-	if m.screen != screenDailyPick {
-		t.Fatalf("opening on an empty day should ask how many, screen=%v", m.screen)
-	}
-	if m.dailyPickSize != 4 {
-		t.Errorf("picker should default to the last choice 4, got %d", m.dailyPickSize)
+	view := m.View()
+	for _, want := range []string{"[⚡ Recon]", "[🔥 Deep Push]", "[⚡ Recon · 15m]"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("home screen is missing %q", want)
+		}
 	}
 }
 
@@ -682,5 +708,51 @@ func TestRoadEntryMarksChallengesAndPlans(t *testing.T) {
 	}
 	if w := lipgloss.Width(plan); w != 70 {
 		t.Errorf("an entry should fill its width, got %d", w)
+	}
+}
+
+// ctrl+o opens the model picker on every screen, draws it over that screen,
+// and closing it goes back there, popups included.
+func TestCtrlOOpensTheModelPickerEverywhere(t *testing.T) {
+	cases := map[string]func(m *model){
+		"home":     func(m *model) {},
+		"new plan": func(m *model) { m.openNewPlan() },
+		"tree":     func(m *model) { m.openTree() },
+		"setup":    func(m *model) { m.openOnboard() },
+		"help":     func(m *model) { m.openHelp() },
+		"road":     func(m *model) { m.openRoad() },
+	}
+	for name, open := range cases {
+		m := newFlowModel(t)
+		m.skills = []db.Skill{{ID: 1, Name: "Python", Category: "Craft"}}
+		m.nodes = sampleTree()
+		open(&m)
+		from := m.screen
+
+		m = send(t, m, key("ctrl+o"))
+		if m.screen != screenModels {
+			t.Errorf("%s: ctrl+o should open the model picker, screen=%v", name, m.screen)
+			continue
+		}
+		if view := m.View(); !strings.Contains(view, "Select Model") {
+			t.Errorf("%s: the picker should be drawn", name)
+		}
+		m = send(t, m, key("esc"))
+		if m.screen != from {
+			t.Errorf("%s: closing should go back to screen %v, got %v", name, from, m.screen)
+		}
+	}
+
+	// From help on the setup screen, both layers come back in order.
+	m := newFlowModel(t)
+	m.openOnboard()
+	m = send(t, m, key("?"))
+	m = send(t, m, key("ctrl+o"))
+	m = send(t, m, key("ctrl+o"))
+	if m.screen != screenHelp || m.prevScreen != screenOnboard {
+		t.Errorf("after the picker: screen=%v under=%v, want help over setup", m.screen, m.prevScreen)
+	}
+	if !strings.Contains(m.renderBottomBar(), "ctrl+o") {
+		t.Error("the footer should show ctrl+o next to the model")
 	}
 }

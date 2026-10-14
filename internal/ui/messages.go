@@ -29,17 +29,26 @@ type roadLoadedMsg struct {
 	err    error
 }
 
-type onboardingDoneMsg struct {
-	count int
+// treeBuiltMsg says the tree for the pending skill at index was saved, or
+// why it was not.
+type treeBuiltMsg struct {
+	index int
 	err   error
+}
+
+// categoryDoneMsg carries the classifier's category for one pending skill,
+// matched back to it by name.
+type categoryDoneMsg struct {
+	name     string
+	category string
+	err      error
 }
 
 type challengesLoadedMsg struct {
 	challenges []db.Challenge
 	stats      db.ChallengeStats
-	// count is the default set size, shown when asking how many to make.
-	count int
-	err   error
+	note       string // what a daily job did, for the status line
+	err        error
 }
 
 type challengeDoneMsg struct {

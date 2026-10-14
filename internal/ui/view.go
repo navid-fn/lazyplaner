@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func (m model) View() string {
@@ -11,42 +12,51 @@ func (m model) View() string {
 		return "Loading…"
 	}
 
+	return fitLines(m.renderBody(m.screen), m.bodyHeight()) + "\n" + m.renderBottomBar()
+}
+
+// renderBody draws screen s. Popups are drawn over the screen that opened
+// them, which stays visible around them: the model picker over whatever
+// screen it came from (another popup included), help and the skill editor
+// over prevScreen, New Plan and the delete prompt over the home screen.
+func (m model) renderBody(s screen) string {
 	bodyH := m.bodyHeight()
+	under := func(prev screen) string {
+		if prev == s {
+			prev = screenMain // never draw a popup under itself
+		}
+		return m.renderBody(prev)
+	}
+	switch s {
+	case screenModels:
+		return overlay(under(m.modelsReturn), m.renderModelPicker(), m.width, bodyH)
+	case screenHelp:
+		return overlay(under(m.prevScreen), m.renderHelp(), m.width, bodyH)
+	case screenSkillEdit:
+		return overlay(under(m.prevScreen), m.renderSkillEdit(), m.width, bodyH)
+	}
 
-	// Help and the skill editor are drawn over the screen that opened them.
 	base := m
-	if m.screen == screenHelp || m.screen == screenSkillEdit || m.screen == screenDaily {
-		base.screen = m.prevScreen
-	}
-	if m.screen == screenDailyPick {
-		// The picker is a small popup on the plan list of its own.
-		base.screen = screenMain
-	}
+	base.screen = s
 	body := base.baseBody()
-
-	// Popups are drawn over the screen, which stays visible around them.
 	switch {
+	case s == screenNewPlan:
+		body = overlay(body, m.renderNewPlan(), m.width, bodyH)
 	case m.confirmDelete != nil:
 		body = overlay(body, m.renderDeletePopup(), m.width, bodyH)
-	case m.screen == screenNewPlan:
-		body = overlay(body, m.renderNewPlan(), m.width, bodyH)
-	case m.screen == screenModels:
-		// The picker opened from New Plan keeps that form visible behind it.
-		if m.prevScreen == screenNewPlan {
-			body = overlay(body, m.renderNewPlan(), m.width, bodyH)
-		}
-		body = overlay(body, m.renderModelPicker(), m.width, bodyH)
-	case m.screen == screenHelp:
-		body = overlay(body, m.renderHelp(), m.width, bodyH)
-	case m.screen == screenSkillEdit:
-		body = overlay(body, m.renderSkillEdit(), m.width, bodyH)
-	case m.screen == screenDaily:
-		body = overlay(body, m.renderDailyPopup(), m.width, bodyH)
-	case m.screen == screenDailyPick:
-		body = overlay(body, m.renderDailyPicker(), m.width, bodyH)
 	}
+	return body
+}
 
-	return body + "\n" + m.renderBottomBar()
+// fitLines pads or cuts s to exactly n lines. The bottom bar sits under the
+// body, so a body one line too tall would push the screen's top out of the
+// terminal.
+func fitLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	for len(lines) < n {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines[:n], "\n")
 }
 
 // baseBody draws the screen for m.screen, without popups.
@@ -54,7 +64,7 @@ func (m model) baseBody() string {
 	switch m.screen {
 	case screenRoad:
 		return m.renderRoadScreen()
-	case screenTree, screenSkillEdit:
+	case screenTree:
 		return m.renderTreeScreen()
 	case screenOnboard:
 		return m.renderOnboardScreen()
@@ -111,19 +121,37 @@ func (m model) renderPreview(innerW int) string {
 }
 
 func (m model) renderBottomBar() string {
+	// The status line is one row, cut to the width. A long error (a model
+	// timeout, say) would otherwise wrap in the terminal and scroll the top
+	// of the screen out of view.
+	oneLine := func(s string) string { return strings.Join(strings.Fields(s), " ") }
 	var statusLine string
 	switch {
 	case m.errorText != "":
-		statusLine = stError.Render("✗ " + m.errorText)
+		statusLine = stError.Render("✗ " + oneLine(m.errorText))
 	case m.isLoading:
-		statusLine = m.spinner.View() + " " + stActive.Render(m.loadingText)
+		statusLine = m.spinner.View() + " " + stActive.Render(oneLine(m.loadingText))
 	case m.statusText != "":
-		statusLine = stSuccess.Render("✓ " + m.statusText)
+		statusLine = stSuccess.Render("✓ " + oneLine(m.statusText))
 	}
+	statusLine = ansi.Truncate(statusLine, max(m.width-1, 1), "…")
 
-	keysLine := m.renderKeys()
-	modelTag := stDim.Render("model ") + stActive.Render(m.modelLabel())
-	gap := max(m.width-lipgloss.Width(keysLine)-lipgloss.Width(modelTag)-2, 2)
+	// The keys come first; the model tag, with the key that changes it,
+	// shows where there is room: in full, then without the key, then not at
+	// all.
+	var keysLine, modelTag string
+	for _, tag := range []string{
+		stKey.Render("ctrl+o") + " " + stDim.Render("◆ "+m.modelLabel()) + " ",
+		stDim.Render("◆ "+m.modelLabel()) + " ",
+		"",
+	} {
+		modelTag = tag
+		keysLine = m.renderKeysFit(m.width - lipgloss.Width(tag) - 2)
+		if lipgloss.Width(keysLine)+lipgloss.Width(tag)+2 <= m.width {
+			break
+		}
+	}
+	gap := max(m.width-lipgloss.Width(keysLine)-lipgloss.Width(modelTag), 0)
 	line := keysLine + strings.Repeat(" ", gap) + modelTag
 
 	separator := stSep.Render(strings.Repeat("─", m.width))
@@ -132,67 +160,149 @@ func (m model) renderBottomBar() string {
 		lipgloss.NewStyle().MaxWidth(m.width).Render(line)
 }
 
-// renderKeys lists the shortcuts that apply to the current screen.
-func (m model) renderKeys() string {
-	type kd struct{ k, d string }
-	var pairs []kd
+// keyHint is one shortcut in the key bar. A hint marked drop is the first
+// to go when the bar does not fit the terminal; the rest always show.
+type keyHint struct {
+	k, d string
+	drop bool
+}
+
+// keyHints returns the current screen's shortcuts in two groups: the
+// actions on what is selected, and the ways to move around. Keys that are
+// obvious (arrows on a list) or rare (setup, model) are left to the help.
+func (m model) keyHints() (actions, nav []keyHint) {
 	switch m.screen {
 	case screenNewPlan:
 		if m.isLoading {
-			pairs = []kd{{"ctrl+c", "quit"}}
-		} else {
-			pairs = []kd{{"tab", "next field"}, {"ctrl+s", "generate"}, {"ctrl+o", "model"}, {"esc", "cancel"}}
+			return nil, []keyHint{{k: "ctrl+c", d: "quit"}}
 		}
+		return []keyHint{{k: "ctrl+s", d: "generate"}},
+			[]keyHint{{k: "tab", d: "next field"}, {k: "esc", d: "cancel"}}
 	case screenModels:
-		pairs = []kd{{"↑↓", "navigate"}, {"enter", "select"}, {"r", "refresh"}, {"esc", "close"}}
+		return []keyHint{{k: "enter", d: "select"}, {k: "r", d: "refresh"}},
+			[]keyHint{{k: "esc/ctrl+o", d: "close"}}
 	case screenRoad:
-		pairs = []kd{{"hjkl ←↑↓→", "move"}, {"enter", "open tree"}, {"?", "help"}, {"c", "back"}, {"q", "quit"}}
+		return []keyHint{{k: "enter", d: "open tree"}},
+			[]keyHint{{k: "hjkl", d: "move", drop: true}, {k: "c", d: "back"}, {k: "?", d: "help"}}
 	case screenTree:
-		pairs = []kd{{"←→ hl", "skill"}, {"↑↓ jk", "node"}, {"e", "edit"}, {"?", "help"}, {"t", "back"}, {"q", "quit"}}
-	case screenDailyPick:
-		pairs = []kd{{"←→", "count"}, {"enter", "generate"}, {"esc", "back"}}
-	case screenDaily:
-		if m.isLoading {
-			pairs = []kd{{"ctrl+c", "quit"}}
-		} else {
-			pairs = []kd{{"↑↓", "move"}, {"enter", "tick off"}, {"g", "close"}}
-			if canRenew(m.challenges) {
-				pairs = append([]kd{{"r", "new set"}}, pairs...)
-			}
+		actions := []keyHint{{k: "enter", d: "complete directive"}}
+		if m.canAskDirective() {
+			actions = append(actions, keyHint{k: "g", d: "new directive"})
 		}
+		return append(actions, keyHint{k: "e", d: "edit skill", drop: true}),
+			[]keyHint{{k: "←→", d: "skill"}, {k: "↑↓", d: "node"}, {k: "t", d: "back"}, {k: "?", d: "help"}}
 	case screenOnboard:
-		if m.isLoading {
-			pairs = []kd{{"ctrl+c", "quit"}}
-		} else {
-			pairs = []kd{{"tab", "next field"}, {"enter", "add/save"}, {"↑↓", "pick (list)"}, {"ctrl+d", "remove"}, {"ctrl+s", "build"}, {"?", "help"}, {"esc", "skip"}}
+		f := m.onboard
+		switch {
+		case m.isLoading || f.building:
+			return nil, []keyHint{{k: "ctrl+c", d: "quit"}}
+		case f.field == fieldList:
+			return []keyHint{{k: "f", d: "toggle active/frozen"}, {k: "enter", d: "edit"}, {k: "ctrl+d", d: "remove", drop: true}},
+				[]keyHint{{k: "ctrl+r", d: "focus form"}, {k: "ctrl+s", d: "build trees"}, {k: "?", d: "help", drop: true}, {k: "esc", d: "skip", drop: true}}
+		case f.editing >= 0:
+			return []keyHint{{k: "enter", d: "save skill"}, {k: "tab", d: "next field", drop: true}},
+				[]keyHint{{k: "esc", d: "cancel edit"}, {k: "?", d: "help", drop: true}}
 		}
+		return []keyHint{{k: "enter", d: "add skill"}, {k: "tab", d: "next field", drop: true}},
+			[]keyHint{{k: "ctrl+r", d: "focus roster"}, {k: "ctrl+s", d: "build trees"}, {k: "?", d: "help", drop: true}, {k: "esc", d: "skip", drop: true}}
 	case screenHelp:
-		pairs = []kd{{"←→", "section"}, {"esc", "close"}}
+		return nil, []keyHint{{k: "←→", d: "section"}, {k: "esc", d: "close"}}
 	case screenSkillEdit:
-		pairs = []kd{{"enter", "save"}, {"esc", "cancel"}}
-	default:
-		if m.confirmDelete != nil {
-			pairs = []kd{{"y", "delete"}, {"any key", "cancel"}}
-			break
-		}
-		if m.mainFocus == focusDirectives {
-			pairs = []kd{{"tab", "plans"}, {"↑↓", "move"}, {"enter", "complete"}, {"g", "daily"}, {"ctrl+n", "new plan"}, {"c", "character"}, {"t", "tree"}, {"s", "setup"}, {"h", "help"}, {"q", "quit"}}
-		} else {
-			pairs = []kd{{"tab", "directives"}, {"↑↓", "navigate"}, {"ctrl+n", "new plan"}, {"e", "edit plan"}, {"d", "delete plan"}, {"c", "character"}, {"t", "tree"}, {"g", "daily"}, {"h", "help"}, {"ctrl+o", "model"}, {"q", "quit"}}
-		}
+		return []keyHint{{k: "enter", d: "save"}}, []keyHint{{k: "esc", d: "cancel"}}
 	}
 
-	sep := stSep.Render("  │  ")
-	parts := make([]string, 0, len(pairs))
-	for _, p := range pairs {
-		parts = append(parts, stKey.Render(p.k)+stDim.Render(" "+p.d))
+	if m.confirmDelete != nil {
+		return []keyHint{{k: "y", d: "delete"}}, []keyHint{{k: "any key", d: "cancel"}}
 	}
-	return "  " + strings.Join(parts, sep)
+	// Hints marked drop go from the last one back, so the order below is
+	// also the order they give way in: tree, then character, then the rest.
+	g := m.dailyKeyLabel()
+	if m.mainFocus == focusDirectives {
+		actions = []keyHint{{k: "enter", d: "complete"}, {k: "r", d: "reroll"}}
+		if g != "" {
+			actions = append(actions, keyHint{k: "g", d: g})
+		}
+		nav = []keyHint{{k: "tab", d: "plans"}, {k: "ctrl+n", d: "new plan", drop: true}}
+	} else {
+		actions = []keyHint{{k: "ctrl+n", d: "new"}, {k: "e", d: "edit"}, {k: "d", d: "delete"}}
+		nav = []keyHint{{k: "tab", d: "directives"}}
+		if g != "" {
+			nav = append(nav, keyHint{k: "g", d: g, drop: true})
+		}
+	}
+	nav = append(nav,
+		keyHint{k: "c", d: "character", drop: true},
+		keyHint{k: "t", d: "tree", drop: true},
+		keyHint{k: "h", d: "help"},
+		keyHint{k: "q", d: "quit"},
+	)
+	return actions, nav
 }
 
+// renderKeys draws the whole key bar, however wide it is.
+func (m model) renderKeys() string {
+	actions, nav := m.keyHints()
+	return drawHints(actions, nav, false)
+}
+
+// renderKeysFit draws the key bar in at most width cells: it drops the
+// droppable hints from the end, then tightens the spacing.
+func (m model) renderKeysFit(width int) string {
+	actions, nav := m.keyHints()
+	line := drawHints(actions, nav, false)
+	for lipgloss.Width(line) > width {
+		var ok bool
+		if nav, ok = dropLast(nav); !ok {
+			if actions, ok = dropLast(actions); !ok {
+				break
+			}
+		}
+		line = drawHints(actions, nav, false)
+	}
+	if lipgloss.Width(line) > width {
+		line = drawHints(actions, nav, true)
+	}
+	return line
+}
+
+// dropLast removes the last droppable hint. ok is false when none is left.
+func dropLast(hints []keyHint) ([]keyHint, bool) {
+	for i := len(hints) - 1; i >= 0; i-- {
+		if hints[i].drop {
+			return append(hints[:i:i], hints[i+1:]...), true
+		}
+	}
+	return hints, false
+}
+
+// drawHints joins the hints with spaces, the two groups with a faint bar.
+// compact uses less space between them.
+func drawHints(actions, nav []keyHint, compact bool) string {
+	gap, bar := "   ", "   │   "
+	if compact {
+		gap, bar = "  ", " │ "
+	}
+	group := func(hints []keyHint) string {
+		parts := make([]string, 0, len(hints))
+		for _, h := range hints {
+			parts = append(parts, stKey.Render(h.k)+" "+stDim.Render(h.d))
+		}
+		return strings.Join(parts, gap)
+	}
+	var groups []string
+	for _, g := range [][]keyHint{actions, nav} {
+		if len(g) > 0 {
+			groups = append(groups, group(g))
+		}
+	}
+	return " " + strings.Join(groups, stSep.Render(bar))
+}
+
+// modelLabel is the selected model's name, without the default ":latest"
+// tag.
 func (m model) modelLabel() string {
 	if m.selectedModel == "" {
-		return "none"
+		return "no model"
 	}
-	return m.selectedModel
+	return strings.TrimSuffix(m.selectedModel, ":latest")
 }

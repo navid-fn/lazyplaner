@@ -127,7 +127,7 @@ func Classify(ctx context.Context, g Generator, subject, detail string, skills [
 
 	return Activity{
 		Skill:      skill,
-		Category:   reply.Category,
+		Category:   settleCategory(skill, reply.Category),
 		Difficulty: clamp(reply.Difficulty, minDiff, maxDiff),
 		Minutes:    clamp(reply.Minutes, minMinutes, maxMinutes),
 		Node:       node,

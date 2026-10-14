@@ -22,7 +22,7 @@ const (
 // Sizes on the home screen, in terminal cells.
 const (
 	hudH          = 1 // the character HUD above the panels
-	directivesMax = 8 // borders, progress line and five challenges
+	directivesMax = 9 // borders, progress line, four directives, the bonus and a footer
 	recentXPCount = 3 // awards shown in the briefing's feed
 )
 
@@ -66,6 +66,9 @@ func (m model) handleHomeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 		}
 		next, cmd := m.completeSelectedChallenge()
 		return next.(model), cmd, true
+	case "r":
+		cmd := m.rerollSelected()
+		return m, cmd, true
 	case "d", "e":
 		// Plan actions only apply where the plans are.
 		m.statusText = "Press tab to move to the plans first."
@@ -137,16 +140,27 @@ func (m model) renderHUD() string {
 	return ansi.Truncate(line, m.width, "…")
 }
 
-// renderDirectives is today's challenges as a compact checklist, with a
-// progress bar on top. With none yet, it says how to get them.
+// renderDirectives is today's directives as a compact checklist, with a
+// progress bar on top. With none yet, it says how to get them. While the
+// model works on them, the header carries the spinner and what it is doing.
 func (m model) renderDirectives(width, height int) string {
 	focused := m.mainFocus == focusDirectives && m.screen == screenMain
 	inner := width - 2
 
+	// While a job runs, the title gives up words so the spinner and its
+	// text fit even in the narrowest column.
+	title := "🎯 Today's Directives"
+	if m.dailyBusy != "" {
+		title = "🎯 Directives " + m.spinner.View() + " " + stActive.Render(m.dailyBusy)
+	}
+
 	if len(m.challenges) == 0 {
-		prompt := "Press " + stChip.Render(" g ") + stDim.Render(" to generate today's strategic directives")
+		prompt := "Press " + stChip.Render(" g ") + stDim.Render(" to generate today's 3 directives")
+		if m.dailyBusy != "" {
+			prompt = stDim.Render("Drafting ⚡ Recon · 🔧 Core Op · 🔥 Deep Push…")
+		}
 		content := "\n" + lipgloss.NewStyle().Width(inner).Align(lipgloss.Center).Render(prompt)
-		return panel("🎯 Today's Directives", content, width, height, focused)
+		return panel(title, content, width, height, focused)
 	}
 
 	done, earned, total := 0, 0, 0
@@ -167,19 +181,34 @@ func (m model) renderDirectives(width, height int) string {
 		if focused && i == m.challengeCursor {
 			pointer = stActive.Render("▸ ")
 		}
-		box, title := stDim.Render("[ ]"), stActive.Render(c.Title)
+		box, name := stDim.Render("[ ]"), stActive.Render(c.Title)
 		if c.Done {
-			box, title = stSuccess.Render("[✓]"), stDim.Strikethrough(true).Render(c.Title)
+			box, name = stSuccess.Render("[✓]"), stDim.Strikethrough(true).Render(c.Title)
 		}
 		xp := " " + categoryStyle(c.Category).Render(truncRunes(c.SkillName, 10)) +
 			stSuccess.Render(fmt.Sprintf(" +%d", c.XP)) + " "
 		left := pointer + box + " "
+		if chip := tierChip(c.Tier); chip != "" {
+			left += chip + " "
+		}
 		room := max(inner-lipgloss.Width(left)-lipgloss.Width(xp), 4)
-		title = ansi.Truncate(title, room, "…")
-		gap := max(room-lipgloss.Width(title), 0)
-		lines = append(lines, left+title+strings.Repeat(" ", gap)+xp)
+		name = ansi.Truncate(name, room, "…")
+		gap := max(room-lipgloss.Width(name), 0)
+		lines = append(lines, left+name+strings.Repeat(" ", gap)+xp)
 	}
-	return panel("🎯 Today's Directives", strings.Join(lines, "\n"), width, height, focused)
+
+	// Without a set (only focus directives from the tree), point at g;
+	// once the set is done, say whether the day's one bonus is left.
+	if !hasSet(m.challenges) && m.dailyBusy == "" {
+		lines = append(lines, ansi.Truncate(" "+stChip.Render(" g ")+stDim.Render(" generate today's set"), inner, "…"))
+	} else if done == len(m.challenges) && m.dailyBusy == "" {
+		footer := stSuccess.Render(" ★ Set complete ") + stChip.Render(" g ") + stDim.Render(" 1 bonus")
+		if bonusUsed(m.challenges) {
+			footer = stSuccess.Render(" ★ Daily cap reached") + stDim.Render(" · new directives tomorrow")
+		}
+		lines = append(lines, ansi.Truncate(footer, inner, "…"))
+	}
+	return panel(title, strings.Join(lines, "\n"), width, height, focused)
 }
 
 // renderPlansPanel is the plan list, or a hint when there are no plans.
@@ -272,6 +301,11 @@ func (m model) briefingSelected(width int) []string {
 	}
 
 	c := m.challenges[m.challengeCursor]
+	if c.Tier == rpg.TierOvertime {
+		lines = append(lines, " "+stSuccess.Bold(true).Render("★ Bonus Overtime Directive"))
+	} else if c.Tier != rpg.TierNone {
+		lines = append(lines, " "+lipgloss.NewStyle().Foreground(colorKeyLabel).Render("["+c.Tier.Label()+"]"))
+	}
 	title := stActive.Render(c.Title)
 	if c.Done {
 		title = stSuccess.Render("✓ " + c.Title)

@@ -22,7 +22,29 @@ const (
 	rootW     = 1  // the skill is a single orb the branches grow from
 
 	nodeBarW = 12 // progress bar inside a node card
+
+	detailH = 5 // lines in the inspector under the map
 )
+
+// fogRange is how far above the skill's level a locked node still shows its
+// name. Nodes further out are hidden in fog until the person levels closer.
+const fogRange = 2
+
+// fogLabel stands in for a node hidden in fog.
+const fogLabel = "░░ [ ??? ]"
+
+// fogged reports whether a node is hidden in fog for a skill at level.
+func fogged(n db.Node, st rpg.Status, level int) bool {
+	return st == rpg.Locked && n.RequiredLevel > level+fogRange
+}
+
+// nodeName is a node's name, or ??? while it is in fog.
+func nodeName(n db.Node, st rpg.Status, level int) string {
+	if fogged(n, st, level) {
+		return "???"
+	}
+	return n.Name
+}
 
 // mapGeom is the size of the cards and gaps for one drawing of the map. It
 // is fitted to the window, so names have room on a wide terminal and the map
@@ -135,6 +157,14 @@ func (m model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if rows > 0 {
 			m.treeNode = min(m.treeNode+1, rows-1)
 		}
+	case "enter", " ":
+		if m.isLoading {
+			return m, nil
+		}
+		return m.completeNodeDirective()
+	case "g":
+		cmd := m.newNodeDirective()
+		return m, cmd
 	case "e":
 		cmd := m.openSkillEdit()
 		return m, cmd
@@ -143,6 +173,87 @@ func (m model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openHelp()
 	}
 	return m, nil
+}
+
+// nodeDirective returns today's directive for a node: an open one if there
+// is one, else a finished one. ok is false when the node has none today.
+func (m model) nodeDirective(skill, node string) (db.Challenge, bool) {
+	var found db.Challenge
+	ok := false
+	for _, c := range m.challenges {
+		if !strings.EqualFold(c.SkillName, skill) || !strings.EqualFold(c.NodeName, node) {
+			continue
+		}
+		if !c.Done {
+			return c, true
+		}
+		found, ok = c, true
+	}
+	return found, ok
+}
+
+// completeNodeDirective ticks off today's open directive for the selected
+// node, straight from the tree's inspector.
+func (m model) completeNodeDirective() (tea.Model, tea.Cmd) {
+	rows := m.treeRows()
+	if len(rows) == 0 {
+		return m, nil
+	}
+	skill := m.skills[m.treeSkill]
+	n := rows[clamp(m.treeNode, 0, len(rows)-1)].node
+	c, ok := m.nodeDirective(skill.Name, n.Name)
+	switch {
+	case !ok:
+		m.statusText = "No directive for this node today."
+		return m, nil
+	case c.Done:
+		m.statusText = "Today's directive for this node is already done."
+		return m, nil
+	}
+	return m.completeChallenge(c)
+}
+
+// canAskDirective reports whether the selected node can get a new directive
+// with g: it is open or rusty and has none today.
+func (m model) canAskDirective() bool {
+	rows := m.treeRows()
+	if len(rows) == 0 {
+		return false
+	}
+	r := rows[clamp(m.treeNode, 0, len(rows)-1)]
+	if r.status != rpg.Unlocked && r.status != rpg.Rusty {
+		return false
+	}
+	_, has := m.nodeDirective(m.skills[m.treeSkill].Name, r.node.Name)
+	return !has
+}
+
+// newNodeDirective asks the model for a focus directive for the selected
+// node. The spinner shows in the inspector until it lands.
+func (m *model) newNodeDirective() tea.Cmd {
+	if m.dailyBusy != "" {
+		return nil
+	}
+	m.errorText, m.statusText = "", ""
+	rows := m.treeRows()
+	if len(rows) == 0 {
+		return nil
+	}
+	r := rows[clamp(m.treeNode, 0, len(rows)-1)]
+	skill := m.skills[m.treeSkill]
+	switch {
+	case r.status == rpg.Done:
+		m.statusText = "This node is done. Pick an open one."
+		return nil
+	case r.status == rpg.Locked:
+		m.statusText = "This node is locked. Pick an open one."
+		return nil
+	case !m.canAskDirective():
+		m.statusText = "This node already has a directive today."
+		return nil
+	}
+	return m.runDailyJob(dailyNode, db.Challenge{SkillName: skill.Name, NodeName: r.node.Name},
+		"Drafting a directive for "+r.node.Name+"…")
 }
 
 // treeRows returns the nodes of the selected skill in depth-first order,
@@ -175,12 +286,12 @@ func (m model) renderTreeScreen() string {
 	innerH := bodyH - 2
 
 	hero := m.treeHero(skill, rows, innerW)
-	detail := treeDetail(skill, rows, cursor, innerW)
+	detail := treeDetail(skill, rows, cursor, innerW) + "\n" + m.treeDirectiveLine(skill, rows, cursor, innerW)
 	rule := lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("─", innerW))
 
-	// The map takes whatever height the header (3), details (4) and two
-	// rules leave.
-	mapH := max(innerH-3-4-2, cardH)
+	// The map takes whatever height the header (3), details and two rules
+	// leave.
+	mapH := max(innerH-3-detailH-2, cardH)
 	treeMap := m.treeMap(skill, rows, cursor, innerW, mapH)
 
 	content := strings.Join([]string{hero, rule, treeMap, rule, detail}, "\n")
@@ -240,7 +351,7 @@ func nextGoal(skill db.Skill, rows []treeRow) string {
 	}
 	status := statusByID(rows)
 
-	// A locked node whose parent is open or done waits only on level.
+	// A locked node whose parent is done waits only on level.
 	unlock := -1
 	closest := -1
 	rusty := -1
@@ -252,8 +363,8 @@ func nextGoal(skill db.Skill, rows []treeRow) string {
 				rusty = i
 			}
 		case rpg.Locked:
-			parentOpen := n.ParentID == 0 || status[n.ParentID] != rpg.Locked
-			if parentOpen && (unlock < 0 || n.RequiredLevel < rows[unlock].node.RequiredLevel) {
+			parentDone := n.ParentID == 0 || status[n.ParentID] == rpg.Done
+			if parentDone && (unlock < 0 || n.RequiredLevel < rows[unlock].node.RequiredLevel) {
 				unlock = i
 			}
 		case rpg.Unlocked:
@@ -274,7 +385,8 @@ func nextGoal(skill db.Skill, rows []treeRow) string {
 	case unlock >= 0:
 		n := rows[unlock].node
 		away := rpg.TotalXPForLevel(n.RequiredLevel) - skill.TotalXP
-		parts = append(parts, stDim.Render("Next unlock ")+stActive.Render("▸ "+n.Name)+
+		name := nodeName(n, rpg.Locked, rpg.ProgressFor(skill.TotalXP).Level)
+		parts = append(parts, stDim.Render("Next unlock ")+stActive.Render("▸ "+name)+
 			stDim.Render(fmt.Sprintf("  at Lv %d · %d xp to go", n.RequiredLevel, away)))
 	case allDone(rows):
 		parts = append(parts, stSuccess.Render("★ Every node in this tree is done. You have mastered it."))
@@ -289,7 +401,8 @@ func nextGoal(skill db.Skill, rows []treeRow) string {
 	return strings.Join(parts, stDim.Render("     ·     "))
 }
 
-// treeDetail is the four-line strip about the selected node.
+// treeDetail is the four-line strip about the selected node. A node in fog
+// shows only how far away it is.
 func treeDetail(skill db.Skill, rows []treeRow, cursor, width int) string {
 	if len(rows) == 0 {
 		return " " + stDim.Render("Nodes appear here once this skill has a tree.") + "\n\n\n"
@@ -298,6 +411,15 @@ func treeDetail(skill db.Skill, rows []treeRow, cursor, width int) string {
 	n := r.node
 	level := rpg.ProgressFor(skill.TotalXP).Level
 	ink := statusInk(r.status)
+
+	if fogged(n, r.status, level) {
+		return " " + lipgloss.NewStyle().Foreground(lipgloss.Color(inkLocked)).Bold(true).Render(fogLabel) +
+			"  " + statusChip(r.status) + "   " +
+			stDim.Render(fmt.Sprintf("hidden in fog · reach Lv %d to reveal · you are Lv %d",
+				n.RequiredLevel-fogRange, level)) + "\n" +
+			"\n" +
+			" " + stDim.Render("Level up closer to this node to see what it is.") + "\n"
+	}
 
 	name := lipgloss.NewStyle().Foreground(lipgloss.Color(ink)).Bold(true).Render(statusIcon(r.status) + " " + n.Name)
 	line1 := " " + name + "  " + statusChip(r.status) + "   " +
@@ -315,7 +437,7 @@ func treeDetail(skill db.Skill, rows []treeRow, cursor, width int) string {
 			parent = other.node.Name
 		}
 		if other.node.ParentID == n.ID {
-			leadsTo = append(leadsTo, other.node.Name)
+			leadsTo = append(leadsTo, nodeName(other.node, other.status, level))
 		}
 	}
 	line2 := " " + gradientBar(frac, 24, ink, lighten(ink, 0.5)) +
@@ -323,6 +445,8 @@ func treeDetail(skill db.Skill, rows []treeRow, cursor, width int) string {
 		"     " + stDim.Render("from ") + parent
 	if len(leadsTo) > 0 {
 		line2 += "     " + stDim.Render("leads to ") + strings.Join(leadsTo, stDim.Render(", "))
+	} else {
+		line2 += "     " + leafNote(n, rows, level)
 	}
 	if r.status == rpg.Rusty {
 		line2 += "     " + lipgloss.NewStyle().Foreground(lipgloss.Color(inkRusty)).
@@ -349,6 +473,49 @@ func treeDetail(skill db.Skill, rows []treeRow, cursor, width int) string {
 		" " + stDim.Render(descLines[1])
 }
 
+// leafNote explains a node nothing grows from. The capstone ends the tree.
+// Any other leaf is a side branch: no node needs it, but its XP still counts
+// toward the level that opens the next column.
+func leafNote(n db.Node, rows []treeRow, level int) string {
+	gate := 0
+	for _, r := range rows {
+		req := r.node.RequiredLevel
+		if r.status == rpg.Locked && req > level && req > n.RequiredLevel && (gate == 0 || req < gate) {
+			gate = req
+		}
+	}
+	if gate == 0 {
+		return stSuccess.Render("★ capstone") + stDim.Render(" · the end of this tree")
+	}
+	return stActive.Render("↳ side branch") +
+		stDim.Render(fmt.Sprintf(" · its XP counts toward Lv %d, which opens the next column", gate))
+}
+
+// treeDirectiveLine is the inspector's last line: today's directive for the
+// selected node, with the key that completes it.
+func (m model) treeDirectiveLine(skill db.Skill, rows []treeRow, cursor, width int) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	c, ok := m.nodeDirective(skill.Name, rows[cursor].node.Name)
+	var line string
+	switch {
+	case m.dailyBusy != "":
+		line = " " + m.spinner.View() + " " + stActive.Render(m.dailyBusy)
+	case !ok && m.canAskDirective():
+		line = " " + stDim.Render("🎯 No directive for this node today.   ") + keyChip("g", "new directive")
+	case !ok:
+		line = " " + stDim.Render("🎯 No directive for this node today.")
+	case c.Done:
+		line = " " + stSuccess.Render(fmt.Sprintf("🎯 ✓ %s · earned %d xp", c.Title, c.XP))
+	default:
+		line = " " + stActive.Render("🎯 "+c.Title) +
+			stDim.Render(fmt.Sprintf("  ◷ %d min  ", c.Minutes)) + chipLabel(fmt.Sprintf("+%d XP", c.XP), colorSuccess) +
+			"   " + keyChip("enter", "complete")
+	}
+	return ansi.Truncate(line, width, "…")
+}
+
 // ─── Map ─────────────────────────────────────────────────────────────────────
 
 // treeMap draws the skill and its nodes as cards joined by lines, cut to a
@@ -361,6 +528,7 @@ func (m model) treeMap(skill db.Skill, rows []treeRow, cursor, viewW, viewH int)
 	status := statusByID(rows)
 	children := childrenOf(nodes)
 	cat := string(categoryColor(skill.Category))
+	level := rpg.ProgressFor(skill.TotalXP).Level
 
 	var selected int64 = -1
 	if len(rows) > 0 {
@@ -399,7 +567,7 @@ func (m model) treeMap(skill db.Skill, rows []treeRow, cursor, viewW, viewH int)
 
 	for _, n := range nodes {
 		if p, ok := pos[n.ID]; ok {
-			drawNodeCard(cv, p, g.cardW, n, status[n.ID], n.ID == selected)
+			drawNodeCard(cv, p, g.cardW, n, status[n.ID], n.ID == selected, fogged(n, status[n.ID], level))
 		}
 	}
 
@@ -537,12 +705,18 @@ func drawCard(cv *canvas, p point, w int, title, borderInk, titleInk string, thi
 }
 
 // drawNodeCard draws one node: its name in the border, and its status icon
-// with a progress bar or the level it needs inside.
-func drawNodeCard(cv *canvas, p point, w int, n db.Node, st rpg.Status, selected bool) {
+// with a progress bar or the level it needs inside. A node in fog shows
+// neither its name nor its level.
+func drawNodeCard(cv *canvas, p point, w int, n db.Node, st rpg.Status, selected, fog bool) {
 	ink := statusInk(st)
 	border := ink
 	if selected {
 		border = inkSelect
+	}
+	if fog {
+		drawCard(cv, p, w, "???", border, ink, selected)
+		cv.text(p.x+2, p.y+1, fogLabel, inkLocked, false)
+		return
 	}
 	drawCard(cv, p, w, n.Name, border, ink, selected)
 

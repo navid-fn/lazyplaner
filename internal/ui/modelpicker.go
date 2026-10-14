@@ -5,10 +5,10 @@ import (
 )
 
 // openModels shows the model picker and refreshes the installed model list.
-// The picker can be opened from the plan list or from the New Plan window;
-// closing it returns to whichever screen opened it.
+// ctrl+o opens it from any screen; closing it returns to the screen that
+// opened it, popups included.
 func (m model) openModels() (tea.Model, tea.Cmd) {
-	m.prevScreen = m.screen
+	m.modelsReturn = m.screen
 	m.screen = screenModels
 	m.errorText = ""
 	return m, loadModelsCmd(m.client)
@@ -16,8 +16,8 @@ func (m model) openModels() (tea.Model, tea.Cmd) {
 
 func (m model) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc":
-		m.screen = m.prevScreen
+	case "esc", "ctrl+o":
+		m.screen = m.modelsReturn
 		return m, nil
 	case "enter":
 		return m.handleSelectModel()

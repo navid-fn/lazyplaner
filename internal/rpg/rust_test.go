@@ -13,8 +13,8 @@ func TestStartProgressPremastersNodesBelowStartLevel(t *testing.T) {
 	cases := []struct {
 		required, start, want int
 	}{
-		{1, 4, 40}, // basics below the start level are already done
-		{3, 4, 120},
+		{1, 4, 60}, // basics below the start level are already done
+		{3, 4, 143},
 		{4, 4, 0}, // at the start level: open, nothing done yet
 		{6, 4, 0}, // above: locked, nothing done
 		{1, 1, 0}, // a beginner has nothing pre-mastered
@@ -208,23 +208,7 @@ func TestAuditSkillReturnsCategory(t *testing.T) {
 
 	// An unknown category is dropped rather than trusted.
 	g = &fakeGen{reply: `{"evidence_summary":"x","start_level":2,"is_rusty":false,"category":"Sports"}`}
-	if a, _ := AuditSkill(context.Background(), g, "Running", "I jog"); a.Category != "" {
+	if a, _ := AuditSkill(context.Background(), g, "Zorbing", "I roll downhill"); a.Category != "" {
 		t.Errorf("unknown category should be dropped, got %q", a.Category)
-	}
-}
-
-func TestBuildRoadmapPassesTheGoal(t *testing.T) {
-	g := &fakeGen{reply: `{"category":"Craft","nodes":[{"parent":-1,"name":"Syntax","description":"","required_level":1}]}`}
-	if _, _, err := BuildRoadmap(context.Background(), g, "Java", 1, "build an Android app"); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(g.gotPrompt, "Their goal: build an Android app") {
-		t.Errorf("prompt should carry the goal: %q", g.gotPrompt)
-	}
-	if _, _, err := BuildRoadmap(context.Background(), g, "Java", 1, "  "); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(g.gotPrompt, "Their goal") {
-		t.Error("an empty goal should leave the prompt alone")
 	}
 }

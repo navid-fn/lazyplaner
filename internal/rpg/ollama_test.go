@@ -65,12 +65,12 @@ func TestOllamaRoadmapAndChallenges(t *testing.T) {
 	}
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel2()
-	drafts, err := BuildChallenges(ctx2, client, skills, 3, nil)
+	drafts, err := BuildDirectives(ctx2, client, DailySlots(skills), nil)
 	if err != nil {
 		t.Fatalf("challenges: %v", err)
 	}
 	for _, d := range drafts {
-		t.Logf("challenge: [%s › %s] %s (%d min, +%d xp)\n    %s", d.Skill, d.Node, d.Title, d.Minutes, d.XP, d.Description)
+		t.Logf("directive [%s]: [%s › %s] %s (%d min, +%d xp)\n    %s", d.Tier.Label(), d.Skill, d.Node, d.Title, d.Minutes, d.XP, d.Description)
 	}
 }
 

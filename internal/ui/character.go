@@ -295,8 +295,8 @@ func skillNext(sk db.Skill, rows []treeRow) string {
 	status := statusByID(rows)
 	best := -1
 	for i, r := range rows {
-		parentOpen := r.node.ParentID == 0 || status[r.node.ParentID] != rpg.Locked
-		if r.status == rpg.Locked && parentOpen &&
+		parentDone := r.node.ParentID == 0 || status[r.node.ParentID] == rpg.Done
+		if r.status == rpg.Locked && parentDone &&
 			(best < 0 || r.node.RequiredLevel < rows[best].node.RequiredLevel) {
 			best = i
 		}
@@ -305,7 +305,8 @@ func skillNext(sk db.Skill, rows []treeRow) string {
 		return stDim.Render("Finish open nodes to go further")
 	}
 	n := rows[best].node
-	return stDim.Render("next ") + stActive.Render("▸ "+n.Name) + stDim.Render(fmt.Sprintf(" at Lv %d", n.RequiredLevel))
+	name := nodeName(n, rpg.Locked, rpg.ProgressFor(sk.TotalXP).Level)
+	return stDim.Render("next ") + stActive.Render("▸ "+name) + stDim.Render(fmt.Sprintf(" at Lv %d", n.RequiredLevel))
 }
 
 // cardFrame draws a bordered card with a title on the left of the top border

@@ -5,26 +5,20 @@ import (
 	"testing"
 )
 
-func TestDailyChallengeCountDefaultsAndClamps(t *testing.T) {
+func TestSettingsRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
 
-	n, err := store.DailyChallengeCount(ctx)
-	if err != nil || n != DefaultDailyChallenges {
-		t.Fatalf("default = %d (%v), want %d", n, err, DefaultDailyChallenges)
+	if _, ok, err := store.GetSetting(ctx, "theme"); err != nil || ok {
+		t.Fatalf("missing key: ok=%v err=%v", ok, err)
 	}
-
-	if err := store.SetDailyChallengeCount(ctx, 4); err != nil {
+	if err := store.SetSetting(ctx, "theme", "dark"); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := store.DailyChallengeCount(ctx); n != 4 {
-		t.Errorf("saved count = %d, want 4", n)
-	}
-
-	if err := store.SetDailyChallengeCount(ctx, 42); err != nil {
+	if err := store.SetSetting(ctx, "theme", "light"); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := store.DailyChallengeCount(ctx); n != MaxDailyChallenges {
-		t.Errorf("count should clamp to %d, got %d", MaxDailyChallenges, n)
+	if v, ok, err := store.GetSetting(ctx, "theme"); err != nil || !ok || v != "light" {
+		t.Errorf("got %q ok=%v err=%v, want the latest value", v, ok, err)
 	}
 }

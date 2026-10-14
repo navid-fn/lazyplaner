@@ -128,20 +128,25 @@ func helpSection(name string, width int) string {
 	case "Keys":
 		lines = []string{
 			head("Plan list"),
-			dim("  ctrl+n new plan · e edit · d delete · ctrl+o model · q quit"),
+			dim("  ctrl+n new plan · e edit · d delete · q quit"),
+			head("Anywhere"),
+			dim("  ctrl+o choose the model (esc or ctrl+o closes the picker)"),
 			head("Screens"),
-			dim("  c character & road · t skill tree · g daily challenges"),
+			dim("  c character & road · t skill tree · g today's directives"),
 			dim("  s character setup · h this help"),
 			head("Character"),
 			dim("  hjkl or arrows move between skills · enter opens its tree"),
 			head("Skill tree"),
 			dim("  ←/→ or h/l switch skill · ↑/↓ or j/k move · e edit · ? help"),
-			head("Daily challenges"),
-			dim("  ↑/↓ move · enter tick off · r new set (when all are done)"),
-			dim("  The first set of the day asks how many challenges you want (1 to 5)."),
+			dim("  enter completes today's open directive for the selected node"),
+			head("Today's directives (home screen)"),
+			dim("  g generates the day's set: ⚡ Recon, 🔧 Core Op, 🔥 Deep Push"),
+			dim("  ↑/↓ move · enter complete · r rerolls the highlighted open one"),
+			dim("  Once all are done, g gives one ★ bonus directive per day."),
 			head("Setup"),
-			dim("  tab next field · enter add/save · ↑↓ pick a skill"),
-			dim("  ctrl+d remove · ctrl+s build trees · esc skip (or cancel edit)"),
+			dim("  tab/↑↓ next field · enter add/save · ctrl+r switch form ⇄ roster"),
+			dim("  roster: ↑↓ pick · f/space toggle active/frozen · enter edit · ctrl+d remove"),
+			dim("  ctrl+s build trees · esc skip (or cancel edit)"),
 		}
 	}
 

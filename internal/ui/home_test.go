@@ -51,7 +51,7 @@ func TestHUDShowsCharacterAndToday(t *testing.T) {
 func TestDirectivesShowPromptWhenEmpty(t *testing.T) {
 	m := homeModel(t, 160, 40)
 	m.challenges = nil
-	if !strings.Contains(m.View(), "to generate today's strategic directives") {
+	if !strings.Contains(m.View(), "to generate today's 3 directives") {
 		t.Error("with no challenges, the directives panel should say how to get them")
 	}
 }
@@ -164,5 +164,35 @@ func TestBriefingShowsNextMoves(t *testing.T) {
 	// Go has a rusty node, so its next move is clearing the rust.
 	if !strings.Contains(view, "⚠ rusty ▸ Errors") {
 		t.Error("a rusty skill's next move should be its rusty node")
+	}
+}
+
+func TestLongBusyTextDoesNotWidenTheDirectivesPanel(t *testing.T) {
+	m := homeModel(t, 120, 32)
+	leftW, _ := m.columnWidths()
+	m.dailyBusy = "Rerolling a directive with a very long title that keeps on going…"
+	panelTop := strings.Split(m.renderDirectives(leftW, 8), "\n")[0]
+	if w := lipgloss.Width(panelTop); w != leftW {
+		t.Errorf("panel top is %d wide, want %d", w, leftW)
+	}
+}
+
+func TestKeyBarFitsAndKeepsTheEssentials(t *testing.T) {
+	for _, w := range []int{70, 100, 190} {
+		m := homeModel(t, w, 30)
+		m.selectedModel = "llama3.2:latest"
+		lines := strings.Split(m.renderBottomBar(), "\n")
+		bar := lines[len(lines)-1]
+		if got := lipgloss.Width(bar); got > w {
+			t.Errorf("width %d: key bar is %d wide", w, got)
+		}
+		for _, want := range []string{"enter", "reroll", "help", "quit", "llama3.2"} {
+			if !strings.Contains(bar, want) {
+				t.Errorf("width %d: key bar is missing %q: %q", w, want, bar)
+			}
+		}
+		if strings.Contains(bar, ":latest") {
+			t.Errorf("width %d: the default tag should be dropped", w)
+		}
 	}
 }

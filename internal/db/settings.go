@@ -5,17 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strconv"
-)
-
-const (
-	// DefaultDailyChallenges is the set size used until the person picks one.
-	DefaultDailyChallenges = 3
-	// MinDailyChallenges and MaxDailyChallenges bound the set size.
-	MinDailyChallenges = 1
-	MaxDailyChallenges = 5
-
-	settingDailyChallenges = "daily_challenges"
 )
 
 // GetSetting returns the value stored under key, and whether it exists.
@@ -42,25 +31,4 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 		return fmt.Errorf("set setting %s: %w", key, err)
 	}
 	return nil
-}
-
-// DailyChallengeCount returns how many challenges a new daily set should
-// have. A missing or invalid value falls back to the default.
-func (s *Store) DailyChallengeCount(ctx context.Context) (int, error) {
-	value, ok, err := s.GetSetting(ctx, settingDailyChallenges)
-	if err != nil || !ok {
-		return DefaultDailyChallenges, err
-	}
-	n, err := strconv.Atoi(value)
-	if err != nil {
-		return DefaultDailyChallenges, nil
-	}
-	return min(max(n, MinDailyChallenges), MaxDailyChallenges), nil
-}
-
-// SetDailyChallengeCount saves how many challenges a new daily set should
-// have, limited to the allowed range.
-func (s *Store) SetDailyChallengeCount(ctx context.Context, n int) error {
-	n = min(max(n, MinDailyChallenges), MaxDailyChallenges)
-	return s.SetSetting(ctx, settingDailyChallenges, strconv.Itoa(n))
 }

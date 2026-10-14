@@ -17,61 +17,81 @@ type RoadNode struct {
 	RequiredLevel int
 }
 
-const roadmapSystem = `You design skill trees for a personal RPG planner.
-A skill tree starts from basic habits and goes to advanced mastery. Each node is one
-concrete sub-skill a person can practise and track. Nodes must be specific to the skill,
-not generic (bad: "Practice", good: "Loops and slices").
-The tree must branch. Use the parent field so that at least two different nodes
-attach to different parents, rather than attaching everything to the first node.
-`
+// RoadmapSize is how many sub-skills the model is asked for.
+const RoadmapSize = 8
 
-const roadmapSchemaJSON = `{
+// The tree's shape is fixed in code, because small models chain every node
+// into one line when asked for parents. treeParents gives each of the eight
+// nodes, in learning order, the index of its parent (-1 for the skill):
+//
+//	column 1: 0 1        two roots
+//	column 2: 2 3 ← 0,   4 ← 1
+//	column 3: 5 ← 3,     6 ← 4
+//	column 4: 7 ← 5      the capstone
+//
+// Every parent comes before its children, so a shorter reply keeps a valid
+// tree by taking the first nodes.
+var (
+	treeParents = [RoadmapSize]int{-1, -1, 0, 0, 1, 3, 4, 5}
+	treeColumn  = [RoadmapSize]int{1, 1, 2, 2, 2, 3, 3, 4}
+)
+
+// roadmapSystem names no other domain on purpose: small models copy any
+// example they are given into the tree.
+const roadmapSystem = `You list the sub-skills of ONE skill for a personal RPG planner, in learning
+order: from the foundations to advanced mastery. Each sub-skill is something a person can
+practise and track, named in 2 to 4 words, with a one-sentence practical milestone that says
+what the person can do once they have it.
+Every single node MUST be 100% strictly about the given skill. Never combine it with or
+mention other hobbies, skills or languages.
+Never use generic names such as "Practice" or "Advanced Topics".`
+
+var roadmapSchemaJSON = fmt.Sprintf(`{
   "type": "object",
   "properties": {
     "category": {"type": "string", "enum": ["Mind", "Body", "Craft", "Social", "Life"]},
     "nodes": {
       "type": "array",
-      "minItems": 4,
-      "maxItems": 12,
+      "minItems": %[1]d,
+      "maxItems": %[1]d,
       "items": {
         "type": "object",
         "properties": {
-          "parent":         {"type": "integer", "minimum": -1, "maximum": 11},
-          "name":           {"type": "string"},
-          "description":    {"type": "string"},
-          "required_level": {"type": "integer", "minimum": 1, "maximum": 10}
+          "name":        {"type": "string"},
+          "description": {"type": "string"}
         },
-        "required": ["parent", "name", "description", "required_level"]
+        "required": ["name", "description"]
       }
     }
   },
   "required": ["category", "nodes"]
-}`
+}`, RoadmapSize)
 
 type roadmapReply struct {
 	Category string `json:"category"`
 	Nodes    []struct {
-		Parent        int    `json:"parent"`
-		Name          string `json:"name"`
-		Description   string `json:"description"`
-		RequiredLevel int    `json:"required_level"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
 	} `json:"nodes"`
 }
 
 // BuildRoadmap asks the model for a skill tree for one skill, and for the
-// category the skill belongs to. level is the character's starting level in
-// it, so the model knows where to begin. goal, when given, is what the person
-// wants to master or build; the advanced nodes are shaped toward it.
+// category the skill belongs to. The model only lists the sub-skills in
+// learning order; the parents and required levels are set in code (see
+// shapeTree), from level, the person's starting level in the skill. goal,
+// when given, is what the person wants to master or build; the advanced
+// nodes are shaped toward it. Nothing about the person's other skills is
+// sent, so they cannot leak into this tree.
 func BuildRoadmap(ctx context.Context, g Generator, skill string, level int, goal string) (string, []RoadNode, error) {
+	skill = strings.TrimSpace(skill)
 	prompt := fmt.Sprintf(
-		"Skill: %s\nThe person already has level %d in this skill.\n%s"+
-			"Pick the category that fits the skill: Mind (learning, study, reading), Body (exercise, "+
-			"health, sleep), Craft (making things, technical skills), Social (people, communication), "+
-			"Life (chores, admin, money). "+
-			"Create a skill tree of 6 to 10 nodes. Node 'parent' is the index of the node it grows "+
-			"from (earlier in this list), or -1 to attach it to the skill. Use required_level 1 for "+
-			"basics and up to 10 for advanced nodes. Keep names to 1-4 words.",
-		strings.TrimSpace(skill), level, goalClause(goal),
+		"Skill: %[1]s\nStarting level: %[2]d of 10.\n%[3]s"+
+			"Pick the category that fits %[1]s: Mind (learning, study), Body (exercise, health), "+
+			"Craft (making things, technical skills, programming), Social (people, communication), "+
+			"Life (chores, admin, money).\n"+
+			"List exactly %[4]d sub-skills of %[1]s, from foundational to advanced mastery. "+
+			"Every node must be strictly about %[1]s.%[5]s",
+		skill, max(level, 1), goalClause(goal), RoadmapSize, goalReminder(goal),
 	)
 
 	raw, err := g.GenerateJSON(ctx, roadmapSystem, prompt, json.RawMessage(roadmapSchemaJSON))
@@ -83,197 +103,110 @@ func BuildRoadmap(ctx context.Context, g Generator, skill string, level int, goa
 	if err := json.Unmarshal([]byte(raw), &reply); err != nil {
 		return "", nil, fmt.Errorf("parse roadmap for %s: %w", skill, err)
 	}
-	if !contains(Categories, reply.Category) {
+	category := settleCategory(skill, reply.Category)
+	if !contains(Categories, category) {
 		return "", nil, fmt.Errorf("roadmap for %s has unknown category %q", skill, reply.Category)
 	}
 	nodes, err := cleanRoadmap(reply, skill)
 	if err != nil {
 		return "", nil, err
 	}
-	return reply.Category, nodes, nil
+	return category, shapeTree(nodes, level), nil
 }
 
-// cleanRoadmap drops nameless and duplicate nodes, keeps parents pointing at
-// nodes that survived and come earlier, and clamps levels. A node whose
-// parent was dropped attaches to the skill instead.
+// cleanRoadmap keeps the named, distinct nodes in order, at most
+// RoadmapSize of them.
 func cleanRoadmap(reply roadmapReply, skill string) ([]RoadNode, error) {
 	seen := map[string]bool{}
-	newIndex := map[int]int{} // original index -> index in out
 	var out []RoadNode
-
-	for i, n := range reply.Nodes {
+	for _, n := range reply.Nodes {
 		name := strings.TrimSpace(n.Name)
 		key := strings.ToLower(name)
 		if name == "" || seen[key] {
 			continue
 		}
 		seen[key] = true
-
-		parent := -1
-		if p, ok := newIndex[n.Parent]; ok {
-			parent = p
+		out = append(out, RoadNode{Name: name, Description: strings.TrimSpace(n.Description)})
+		if len(out) == RoadmapSize {
+			break
 		}
-		newIndex[i] = len(out)
-		out = append(out, RoadNode{
-			Parent:        parent,
-			Name:          name,
-			Description:   strings.TrimSpace(n.Description),
-			RequiredLevel: clamp(n.RequiredLevel, 1, 10),
-		})
 	}
-
 	if len(out) == 0 {
 		return nil, fmt.Errorf("model returned no usable nodes for %s", skill)
 	}
 	return out, nil
 }
 
+// shapeTree wires nodes, in learning order, into the fixed tree shape and
+// sets each node's required level from the skill's start level L, so that
+// there is always work open at the start:
+//
+//   - L = 1: both roots are open; column 2 needs Lv 2, column 3 Lv 4, the
+//     capstone Lv 6.
+//   - L > 1: the roots (Lv L-2, at least 1) and node 2 (Lv L-1) are below
+//     the start level, so they start done; nodes 3 and 4 need exactly L, so
+//     two nodes are open; column 3 needs L+1, and the capstone L+3, which
+//     keeps it in fog.
+//
+// Nodes below the start level start done (see StartProgress).
+func shapeTree(nodes []RoadNode, startLevel int) []RoadNode {
+	l := max(startLevel, 1)
+	out := make([]RoadNode, len(nodes))
+	for i, n := range nodes {
+		n.Parent = treeParents[i]
+		n.RequiredLevel = nodeLevel(i, l)
+		out[i] = n
+	}
+	return out
+}
+
+// nodeLevel is the required level of the node at index i of the tree shape
+// for a skill starting at level l.
+func nodeLevel(i, l int) int {
+	if l == 1 {
+		return [...]int{1, 1, 2, 2, 2, 4, 4, 6}[i]
+	}
+	switch {
+	case treeColumn[i] == 1:
+		return max(1, l-2)
+	case i == 2:
+		return l - 1
+	case treeColumn[i] == 2:
+		return l
+	case treeColumn[i] == 3:
+		return l + 1
+	default:
+		return l + 3
+	}
+}
+
 // goalClause tells the model what the person is aiming for, if anything.
+// With a goal, the tree is about that goal: most nodes must train what it
+// takes, so a vague wellness or beginner tree does not come back.
 func goalClause(goal string) string {
 	goal = strings.TrimSpace(goal)
 	if goal == "" {
 		return ""
 	}
-	return fmt.Sprintf("Their goal: %s. Shape the advanced nodes toward this goal.\n",
-		truncateRunes(goal, MaxGoalLength))
+	return fmt.Sprintf("Target goal: %q.\n"+
+		"CRITICAL: at least %d of the %d nodes MUST directly train the specific sub-skills "+
+		"this exact goal needs. Do NOT output generic filler nodes such as hydration, sleep, "+
+		"mental health or basic syntax when a goal is given.\n",
+		truncateRunes(goal, MaxGoalLength), RoadmapSize-2, RoadmapSize)
+}
+
+// goalReminder repeats the goal at the end of the prompt, where small models
+// pay the most attention.
+func goalReminder(goal string) string {
+	goal = strings.TrimSpace(goal)
+	if goal == "" {
+		return ""
+	}
+	return fmt.Sprintf(" Build the nodes toward the goal: %q.", truncateRunes(goal, MaxGoalLength))
 }
 
 // MaxGoalLength caps the goal sentence sent to the model.
 const MaxGoalLength = 160
-
-// ChallengeDraft is one generated daily challenge, before it is saved.
-type ChallengeDraft struct {
-	Skill       string
-	Node        string
-	Title       string
-	Description string
-	Difficulty  int
-	Minutes     int
-	XP          int
-}
-
-const challengeSystem = `You design small daily challenges for a personal RPG planner.
-Each challenge is concrete and can be done in one sitting today. Vary the skills.
-Every challenge needs a description of one or two short sentences, under 160 characters,
-that says exactly what to do and how the person will know it is finished.`
-
-const challengeSchemaJSON = `{
-  "type": "object",
-  "properties": {
-    "challenges": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 5,
-      "items": {
-        "type": "object",
-        "properties": {
-          "skill":      {"type": "string"},
-          "node":       {"type": "string"},
-          "title":       {"type": "string"},
-          "description": {"type": "string"},
-          "difficulty":  {"type": "integer", "minimum": 1, "maximum": 5},
-          "minutes":     {"type": "integer", "minimum": 5, "maximum": 120}
-        },
-        "required": ["skill", "node", "title", "description", "difficulty", "minutes"]
-      }
-    }
-  },
-  "required": ["challenges"]
-}`
-
-// avoidClause asks the model not to repeat titles already used today.
-func avoidClause(avoid []string) string {
-	if len(avoid) == 0 {
-		return ""
-	}
-	return "\nDo not repeat these challenges from earlier today: " + strings.Join(avoid, "; ") + "."
-}
-
-type challengeReply struct {
-	Challenges []struct {
-		Skill       string `json:"skill"`
-		Node        string `json:"node"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Difficulty  int    `json:"difficulty"`
-		Minutes     int    `json:"minutes"`
-	} `json:"challenges"`
-}
-
-// BuildChallenges asks the model for count daily challenges spread over the
-// given skills. avoid lists challenge titles already set today, so a new set
-// does not repeat them. Challenges that name an unknown skill are dropped. An
-// unknown node is cleared, so the challenge still counts toward the skill.
-func BuildChallenges(ctx context.Context, g Generator, skills []SkillOutline, count int, avoid []string) ([]ChallengeDraft, error) {
-	if len(skills) == 0 {
-		return nil, errors.New("no skills to build challenges for")
-	}
-	count = clamp(count, 1, 5)
-
-	prompt := fmt.Sprintf(
-		"EXISTING SKILLS:\n%s\nCreate %d daily challenges of 5 to 45 minutes each. "+
-			"Pick skills from the list above by exact name. Set node to one of that skill's "+
-			"nodes when it fits, otherwise leave it empty.%s",
-		formatOutlines(skills), count, avoidClause(avoid),
-	)
-
-	raw, err := g.GenerateJSON(ctx, challengeSystem, prompt, json.RawMessage(challengeSchemaJSON))
-	if err != nil {
-		return nil, fmt.Errorf("build challenges: %w", err)
-	}
-
-	var reply challengeReply
-	if err := json.Unmarshal([]byte(raw), &reply); err != nil {
-		return nil, fmt.Errorf("parse challenges: %w", err)
-	}
-
-	names := make([]string, 0, len(skills))
-	for _, s := range skills {
-		names = append(names, s.Name)
-	}
-
-	var out []ChallengeDraft
-	for _, c := range reply.Challenges {
-		title := strings.TrimSpace(c.Title)
-		skill := normalize(c.Skill, names)
-		// With one skill there is only one place a challenge can go, so an
-		// unmatched name is not worth dropping.
-		if !contains(names, skill) && len(names) == 1 {
-			skill = names[0]
-		}
-		if title == "" || !contains(names, skill) {
-			continue
-		}
-
-		var nodes []string
-		for _, s := range skills {
-			if s.Name == skill {
-				nodes = s.Nodes
-			}
-		}
-		node := normalize(c.Node, nodes)
-		if !contains(nodes, node) {
-			node = ""
-		}
-
-		diff := clamp(c.Difficulty, minDiff, maxDiff)
-		mins := clamp(c.Minutes, minMinutes, maxMinutes)
-		out = append(out, ChallengeDraft{
-			Skill:       skill,
-			Node:        node,
-			Title:       title,
-			Description: strings.TrimSpace(c.Description),
-			Difficulty:  diff,
-			Minutes:     mins,
-			XP:          Award(Activity{Difficulty: diff, Minutes: mins}),
-		})
-	}
-
-	if len(out) == 0 {
-		return nil, errors.New("model returned no usable challenges")
-	}
-	return out, nil
-}
 
 func contains(list []string, s string) bool {
 	for _, v := range list {
@@ -352,7 +285,7 @@ func AuditSkill(ctx context.Context, g Generator, skill, experience string) (Aud
 	}
 
 	// An unknown category is left empty; the tree build then picks one.
-	category := reply.Category
+	category := settleCategory(skill, reply.Category)
 	if !contains(Categories, category) {
 		category = ""
 	}

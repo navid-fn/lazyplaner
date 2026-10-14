@@ -49,13 +49,27 @@ type pendingSkill struct {
 	Experience string // the person's own account of their standing, if any
 	Goal       string // what they want to master or build, if any
 	Evidence   string // the auditor's summary of Experience
-	Category   string // from the auditor; empty until it answers or without one
+	Category   string // from the auditor or the classifier; empty until one answers
 	Rusty      bool
 	Auditing   bool // the auditor is still working on it
+	// Classifying is set while the model picks a category for a skill
+	// added without experience (the auditor picks it otherwise).
+	Classifying bool
+	// Frozen skills start garrisoned. The list keeps active skills first,
+	// so its order is the order the two roster groups show.
+	Frozen bool
 }
 
-// garrisoned reports whether the pending skill at index i starts parked.
-func garrisoned(i int) bool { return i >= maxActiveFronts }
+// activeCount is how many pending skills start active.
+func activeCount(pending []pendingSkill) int {
+	n := 0
+	for _, p := range pending {
+		if !p.Frozen {
+			n++
+		}
+	}
+	return n
+}
 
 // onboardForm holds the state of the character setup screen.
 type onboardForm struct {
@@ -65,8 +79,14 @@ type onboardForm struct {
 	field      onboardField
 	level      int // manual level, 1 to 5
 	pending    []pendingSkill
-	cursor     int // selected row in pending, used when the list has focus
-	editing    int // index in pending being edited, or -1
+	cursor     int          // selected row in pending, used when the list has focus
+	editing    int          // index in pending being edited, or -1
+	lastField  onboardField // form field tab returns to from the list
+
+	// building is set while the trees are designed, one skill at a time;
+	// built counts the skills saved so far.
+	building bool
+	built    int
 
 	// note is the message under the name field. It is an error after a
 	// rejected entry and a hint otherwise.
@@ -111,6 +131,33 @@ func (f onboardForm) auditing() bool {
 	return false
 }
 
+// busy reports whether anything on the setup screen is waiting on the
+// model, so the spinner keeps turning.
+func (f onboardForm) busy() bool {
+	if f.building || f.auditing() {
+		return true
+	}
+	for _, p := range f.pending {
+		if p.Classifying {
+			return true
+		}
+	}
+	return false
+}
+
+// resetNote puts back the hint for the current mode.
+func (f *onboardForm) resetNote() {
+	f.note, f.noteError = onboardHint, false
+	if f.editing >= 0 {
+		f.note = onboardEditHint
+	}
+}
+
+// readingNote is the message shown while the auditor reads a skill.
+func readingNote(verb, name string) string {
+	return fmt.Sprintf("%s %s. The auditor is reading your experience…", verb, name)
+}
+
 // openOnboard shows the character setup screen with the name field focused.
 func (m *model) openOnboard() tea.Cmd {
 	m.screen = screenOnboard
@@ -142,10 +189,24 @@ func (m *model) sizeOnboardInputs() {
 // ─── Keys ────────────────────────────────────────────────────────────────────
 
 func (m model) handleOnboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.isLoading {
+	f := &m.onboard
+	if m.isLoading || f.building {
 		return m, nil
 	}
-	f := &m.onboard
+
+	// The roster has its own keys: f or space moves a skill between the
+	// active fronts and the garrison, and ←/→ (like ctrl+r) go back to the
+	// form.
+	if f.field == fieldList {
+		switch msg.String() {
+		case "f", " ":
+			f.toggleFrozen()
+			return m, nil
+		case "left", "right":
+			cmd := f.setField(f.lastField)
+			return m, cmd
+		}
+	}
 
 	switch msg.String() {
 	case "?":
@@ -166,23 +227,33 @@ func (m model) handleOnboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statusText = "Setup skipped. Add skills later, or it opens again on the next start."
 		return m, nil
 
-	case "tab", "shift+tab":
+	case "ctrl+r":
+		// ctrl+r switches between the form and the roster.
+		next := fieldList
+		if f.field == fieldList {
+			next = f.lastField
+		}
+		cmd := f.setField(next)
+		return m, cmd
+
+	case "tab", "shift+tab", "up", "down":
+		// Tab and the arrows step through the form's fields; in the roster
+		// the arrows pick a card and tab does nothing.
 		step := 1
-		if msg.String() == "shift+tab" {
+		if msg.String() == "up" || msg.String() == "shift+tab" {
 			step = -1
+		}
+		if f.field == fieldList && (msg.String() == "tab" || msg.String() == "shift+tab") {
+			return m, nil
+		}
+		if f.field == fieldList {
+			if len(f.pending) > 0 {
+				f.cursor = clamp(f.cursor+step, 0, len(f.pending)-1)
+			}
+			return m, nil
 		}
 		cmd := f.setField(f.nextField(step))
 		return m, cmd
-
-	case "up", "down":
-		if f.field == fieldList && len(f.pending) > 0 {
-			step := 1
-			if msg.String() == "up" {
-				step = -1
-			}
-			f.cursor = clamp(f.cursor+step, 0, len(f.pending)-1)
-		}
-		return m, nil
 
 	case "left", "right":
 		if f.field == fieldLevel && !f.levelLocked() {
@@ -215,11 +286,14 @@ func (m model) handleOnboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-		m.isLoading = true
-		m.loadingText = "Designing your skill trees…"
+		// The form is locked while the trees are built: no cursor, no
+		// edits, and the progress shows once, in the form.
+		f.building, f.built = true, 0
+		f.blurAll()
+		f.note, f.noteError = "", false
 		m.errorText = ""
 		m.statusText = ""
-		return m, tea.Batch(m.spinner.Tick, buildSkillTreesCmd(m.client, m.store, f.pending))
+		return m, tea.Batch(m.spinner.Tick, buildSkillTreeCmd(m.client, m.store, f.pending, 0))
 	}
 
 	// Typing goes to the name field when the level or list has focus, so
@@ -232,6 +306,7 @@ func (m model) handleOnboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
+	before := f.name.Value() + "\x00" + f.experience.Value() + "\x00" + f.goal.Value()
 	switch f.field {
 	case fieldName:
 		f.name, cmd = f.name.Update(msg)
@@ -242,19 +317,25 @@ func (m model) handleOnboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	default:
 		return m, nil
 	}
-	// A new edit clears the old message; the hint returns.
-	if f.noteError {
-		f.note, f.noteError = onboardHint, false
+	// Typing starts a new entry, so the message about the last one (an
+	// error, "Added …", the auditor's progress) gives way to the hint.
+	if f.name.Value()+"\x00"+f.experience.Value()+"\x00"+f.goal.Value() != before {
+		f.resetNote()
 	}
 	return m, cmd
 }
 
-// nextField is the field step positions away from the current one, skipping
-// the level selector while the auditor owns the level.
+// formFieldCount is the number of fields in the form; the list comes after
+// them.
+const formFieldCount = int(fieldList)
+
+// nextField is the form field step positions away from the current one,
+// wrapping around and skipping the level selector while the auditor owns
+// the level.
 func (f onboardForm) nextField(step int) onboardField {
 	next := f.field
-	for range fieldCount {
-		next = onboardField((int(next) + step + int(fieldCount)) % int(fieldCount))
+	for range formFieldCount {
+		next = onboardField((int(next) + step + formFieldCount) % formFieldCount)
 		if next != fieldLevel || !f.levelLocked() {
 			return next
 		}
@@ -262,13 +343,82 @@ func (f onboardForm) nextField(step int) onboardField {
 	return next
 }
 
+// toggleFrozen moves the selected skill between the active fronts and the
+// garrison. Promoting a skill when all fronts are taken swaps it with the
+// last active one. The list stays active-first, and the cursor follows the
+// skill.
+func (f *onboardForm) toggleFrozen() {
+	if len(f.pending) == 0 {
+		return
+	}
+	if f.editing >= 0 {
+		f.note, f.noteError = "Finish or cancel the edit first (enter or esc).", true
+		return
+	}
+	i := f.cursor
+	moved := f.pending[i]
+	var swapped string
+	if moved.Frozen && activeCount(f.pending) >= maxActiveFronts {
+		last := activeCount(f.pending) - 1
+		f.pending[last].Frozen = true
+		swapped = f.pending[last].Name
+	}
+	moved.Frozen = !moved.Frozen
+	f.pending[i] = moved
+
+	// Rebuild the order: actives, the promoted skill last among them; then
+	// the frozen, a demoted skill first among them.
+	var active, frozen []pendingSkill
+	for j, p := range f.pending {
+		if j == i {
+			continue
+		}
+		if p.Frozen {
+			frozen = append(frozen, p)
+		} else {
+			active = append(active, p)
+		}
+	}
+	if moved.Frozen {
+		frozen = append([]pendingSkill{moved}, frozen...)
+	} else {
+		active = append(active, moved)
+	}
+	if swapped != "" {
+		// The demoted skill leads the garrison, just after the old order.
+		for j, p := range frozen {
+			if p.Name == swapped {
+				frozen = append(append([]pendingSkill{p}, frozen[:j]...), frozen[j+1:]...)
+				break
+			}
+		}
+	}
+	f.pending = append(active, frozen...)
+	for j, p := range f.pending {
+		if p.Name == moved.Name {
+			f.cursor = j
+		}
+	}
+
+	switch {
+	case swapped != "":
+		f.note = fmt.Sprintf("%s is now active; %s moved to the garrison.", moved.Name, swapped)
+	case moved.Frozen:
+		f.note = moved.Name + " moved to the garrison (frozen, it will not rust)."
+	default:
+		f.note = moved.Name + " is now an active front."
+	}
+	f.noteError = false
+}
+
 // setField moves focus to next, blurring the text inputs it leaves and
 // focusing the one it enters.
 func (f *onboardForm) setField(next onboardField) tea.Cmd {
 	f.field = next
-	f.name.Blur()
-	f.experience.Blur()
-	f.goal.Blur()
+	if next != fieldList {
+		f.lastField = next
+	}
+	f.blurAll()
 	switch next {
 	case fieldName:
 		return f.name.Focus()
@@ -278,6 +428,13 @@ func (f *onboardForm) setField(next onboardField) tea.Cmd {
 		return f.goal.Focus()
 	}
 	return nil
+}
+
+// blurAll hides the cursor in every text input.
+func (f *onboardForm) blurAll() {
+	f.name.Blur()
+	f.experience.Blur()
+	f.goal.Blur()
 }
 
 // resetInputs clears the three text inputs.
@@ -291,7 +448,7 @@ func (f *onboardForm) resetInputs() {
 func (f *onboardForm) cancelEdit() {
 	f.editing = -1
 	f.resetInputs()
-	f.note, f.noteError = onboardHint, false
+	f.resetNote()
 }
 
 // existingNames lists the names a skill being typed must not clash with. The
@@ -316,7 +473,7 @@ func (m model) existingNames() []string {
 // is typed. A rejected name stays in the field so it can be fixed.
 func (m model) commitSkill() (tea.Model, tea.Cmd) {
 	f := &m.onboard
-	name := strings.TrimSpace(f.name.Value())
+	name := rpg.NormalizeSkillName(f.name.Value())
 
 	if f.editing < 0 && len(f.pending) >= rpg.MaxStartSkills {
 		f.note = fmt.Sprintf("Up to %d skills per setup. Press ctrl+s to build, or ctrl+d to remove one.", rpg.MaxStartSkills)
@@ -337,35 +494,56 @@ func (m model) commitSkill() (tea.Model, tea.Cmd) {
 		Goal:       strings.TrimSpace(f.goal.Value()),
 		Auditing:   experience != "",
 	}
-	var audit tea.Cmd
-	if skill.Auditing {
-		audit = tea.Batch(m.spinner.Tick, auditSkillCmd(m.client, name, experience))
+	// Without experience the auditor does not run, so a small classifier
+	// picks the category. An edit that keeps the name keeps its category.
+	if !skill.Auditing {
+		if f.editing >= 0 && strings.EqualFold(f.pending[f.editing].Name, name) {
+			skill.Category = f.pending[f.editing].Category
+		}
+		skill.Classifying = skill.Category == ""
+	}
+	var work tea.Cmd
+	switch {
+	case skill.Auditing:
+		work = tea.Batch(m.spinner.Tick, auditSkillCmd(m.client, name, experience))
+	case skill.Classifying:
+		work = tea.Batch(m.spinner.Tick, categorizeSkillCmd(m.client, name))
 	}
 
 	verb := "Added"
 	if f.editing >= 0 {
+		skill.Frozen = f.pending[f.editing].Frozen
 		f.pending[f.editing] = skill
 		f.cursor = f.editing
 		f.editing = -1
 		verb = "Saved"
 	} else {
-		f.pending = append(f.pending, skill)
-		f.cursor = len(f.pending) - 1
+		// A new skill takes a free front, or else waits in the garrison.
+		// Active skills stay ahead of frozen ones in the list.
+		at := activeCount(f.pending)
+		skill.Frozen = at >= maxActiveFronts
+		if skill.Frozen {
+			at = len(f.pending)
+		}
+		f.pending = append(f.pending[:at], append([]pendingSkill{skill}, f.pending[at:]...)...)
+		f.cursor = at
 	}
 	f.resetInputs()
 	if skill.Auditing {
-		f.note, f.noteError = fmt.Sprintf("%s %s. The auditor is reading your experience…", verb, name), false
+		f.note, f.noteError = readingNote(verb, name), false
 	} else {
 		f.note, f.noteError = fmt.Sprintf("%s %s. Add another, or ctrl+s to build.", verb, name), false
 	}
 	cmd := f.setField(fieldName)
-	return m, tea.Batch(cmd, audit)
+	return m, tea.Batch(cmd, work)
 }
 
 // applyAudit puts the auditor's answer on the pending skill it was for. The
 // skill is matched by name; if it was removed or renamed meanwhile, the
-// answer is dropped.
-func (m *model) applyAudit(msg auditDoneMsg) {
+// answer is dropped. The card shows the result, so the form's message only
+// changes on an error. When the audit gives no category, the classifier is
+// asked instead.
+func (m *model) applyAudit(msg auditDoneMsg) tea.Cmd {
 	f := &m.onboard
 	for i := range f.pending {
 		p := &f.pending[i]
@@ -373,23 +551,73 @@ func (m *model) applyAudit(msg auditDoneMsg) {
 			continue
 		}
 		p.Auditing = false
+		if f.note == readingNote("Added", p.Name) || f.note == readingNote("Saved", p.Name) {
+			f.resetNote()
+		}
 		if msg.err != nil {
 			f.note = fmt.Sprintf("The auditor could not read %s, so it stays at Lv %d. (%v)", p.Name, p.Level, msg.err)
 			f.noteError = true
+		} else {
+			p.Level = msg.audit.StartLevel
+			p.Rusty = msg.audit.Rusty
+			p.Evidence = msg.audit.Evidence
+			p.Category = msg.audit.Category
+		}
+		if p.Category == "" {
+			p.Classifying = true
+			return categorizeSkillCmd(m.client, p.Name)
+		}
+		return nil
+	}
+	return nil
+}
+
+// applyCategory puts the classifier's answer on the pending skill it was
+// for. A failed classification leaves the category to the tree builder.
+func (m *model) applyCategory(msg categoryDoneMsg) {
+	for i := range m.onboard.pending {
+		p := &m.onboard.pending[i]
+		if strings.EqualFold(p.Name, msg.name) && p.Classifying {
+			p.Classifying = false
+			if msg.err == nil {
+				p.Category = msg.category
+			}
 			return
 		}
-		p.Level = msg.audit.StartLevel
-		p.Rusty = msg.audit.Rusty
-		p.Evidence = msg.audit.Evidence
-		p.Category = msg.audit.Category
-		rust := ""
-		if p.Rusty {
-			rust = ", rusty"
-		}
-		f.note = fmt.Sprintf("Auditor: %s starts at Lv %d (%s%s).", p.Name, p.Level, levelNames[p.Level], rust)
-		f.noteError = false
-		return
 	}
+}
+
+// handleTreeBuilt records one saved tree and starts the next. When the last
+// one is saved, setup closes. On an error, the skills already saved leave
+// the list, so building again continues with the rest.
+func (m model) handleTreeBuilt(msg treeBuiltMsg) (tea.Model, tea.Cmd) {
+	f := &m.onboard
+	if !f.building {
+		return m, nil
+	}
+	if msg.err != nil {
+		f.building = false
+		f.pending = f.pending[msg.index:]
+		f.cursor = 0
+		m.errorText = msg.err.Error()
+		if msg.index > 0 {
+			f.note, f.noteError = fmt.Sprintf("Saved %d tree%s. Press ctrl+s to retry the rest.",
+				msg.index, plural(msg.index)), true
+		}
+		cmd := f.setField(fieldName)
+		return m, cmd
+	}
+
+	f.built = msg.index + 1
+	if f.built < len(f.pending) {
+		return m, buildSkillTreeCmd(m.client, m.store, f.pending, f.built)
+	}
+	count := f.built
+	f.building = false
+	m.errorText = ""
+	m.screen = screenMain
+	m.statusText = fmt.Sprintf("Character created with %d skill tree%s.", count, plural(count))
+	return m, tea.Batch(loadRoadCmd(m.store), loadDailyCmd(m.store))
 }
 
 // loadPendingForEdit copies the selected skill into the form and moves focus
@@ -462,21 +690,23 @@ func (m model) renderPendingList(width int) string {
 			stDim.Render("Type one on the right and press enter.")
 	}
 
+	// Active skills come first in the list, so each group is a run of it.
+	active := activeCount(f.pending)
 	var lines []string
 	lines = append(lines, sectionHeader("⚔️  Active Fronts",
-		fmt.Sprintf("%d/%d", min(len(f.pending), maxActiveFronts), maxActiveFronts), width))
-	for i := 0; i < min(len(f.pending), maxActiveFronts); i++ {
+		fmt.Sprintf("%d/%d", active, maxActiveFronts), width))
+	for i := 0; i < active; i++ {
 		lines = append(lines, m.pendingCard(i, width))
 	}
 
 	lines = append(lines, "", sectionHeader("🛡️  Garrisoned / Backlog",
-		fmt.Sprint(max(len(f.pending)-maxActiveFronts, 0)), width))
-	if len(f.pending) <= maxActiveFronts {
+		fmt.Sprint(len(f.pending)-active), width))
+	if active == len(f.pending) {
 		lines = append(lines,
-			" "+stDim.Render(fmt.Sprintf("Skills %d–%d wait here, frozen, so you", maxActiveFronts+1, rpg.MaxStartSkills)),
-			" "+stDim.Render("can focus on three at a time."))
+			" "+stDim.Render("Skills past the first three wait here, frozen,"),
+			" "+stDim.Render("so you can focus on three at a time."))
 	}
-	for i := maxActiveFronts; i < len(f.pending); i++ {
+	for i := active; i < len(f.pending); i++ {
 		lines = append(lines, m.pendingCard(i, width))
 	}
 
@@ -498,10 +728,13 @@ func (m model) pendingCard(i, width int) string {
 	f := m.onboard
 	p := f.pending[i]
 	inner := width - 4
-	frozen := garrisoned(i)
+	frozen := p.Frozen
 	selected := f.field == fieldList && i == f.cursor
 
 	label, labelInk := "auto", "242"
+	if p.Classifying {
+		label = "…"
+	}
 	if p.Category != "" {
 		label, labelInk = p.Category, string(categoryColor(p.Category))
 	}
@@ -600,13 +833,15 @@ func (m model) renderOnboardForm(width int) string {
 		"",
 	}
 
-	if m.isLoading {
-		lines = append(lines, m.spinner.View()+" "+stActive.Render(m.loadingText))
-	} else {
-		lines = append(lines, wrapPills([]string{
-			keyChip("enter", "add"), keyChip("tab", "next"), keyChip("ctrl+s", "build"),
-			keyChip("?", "help"), keyChip("esc", "skip"),
-		}, width, "  "))
+	// The build's progress shows here and only here; the keys are in the
+	// footer.
+	if f.building {
+		current := ""
+		if f.built < len(f.pending) {
+			current = ": " + f.pending[f.built].Name
+		}
+		lines = append(lines, ansi.Truncate(m.spinner.View()+" "+stActive.Render(fmt.Sprintf(
+			"Designing skill trees (%d/%d%s)…", f.built+1, len(f.pending), current)), width, "…"))
 	}
 
 	ideaStyle := lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("252")).Padding(0, 1)

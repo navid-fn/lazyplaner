@@ -1,11 +1,13 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/navid-fn/lazyplaner/internal/db"
+	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
 
 // sampleTree is shaped like a real generated tree: a chain with branches.
@@ -152,8 +154,9 @@ func TestViewOffsetCentersSmallMapsAndFollowsFocus(t *testing.T) {
 func TestTreeScreenShowsCardsAndDetail(t *testing.T) {
 	m := newFlowModel(t)
 	m.width, m.height = 160, 40
-	m.skills = []db.Skill{{ID: 1, Name: "Python", Category: "Craft", TotalXP: 300}}
+	m.skills = []db.Skill{{ID: 1, Name: "Python", Category: "Craft"}}
 	m.nodes = sampleTree()
+	m.nodes[0].Progress = 40 // Basics done, so Tooling waits only on level
 	m.openTree()
 
 	view := m.View()
@@ -188,9 +191,57 @@ func TestTreeScreenFitsANarrowTerminal(t *testing.T) {
 			t.Errorf("line %d is %d wide, wider than %d", i, w, m.width)
 		}
 	}
-	// The map scrolls so the selected node (Patterns) is on screen.
-	if !strings.Contains(view, "Patterns") {
-		t.Error("the selected node should be scrolled into view")
+	// The map scrolls so the selected node (Patterns, Lv 6) is on screen,
+	// but at Lv 1 it is hidden in fog.
+	if !strings.Contains(view, fogLabel) || !strings.Contains(view, "reach Lv 4 to reveal") {
+		t.Error("the selected node should be scrolled into view, masked by fog")
+	}
+	if strings.Contains(view, "Patterns") {
+		t.Error("a node in fog must not show its name")
+	}
+}
+
+func TestFogLiftsWithinTwoLevels(t *testing.T) {
+	n := db.Node{Name: "Patterns", RequiredLevel: 6}
+	if !fogged(n, rpg.Locked, 3) {
+		t.Error("Lv 6 node at Lv 3 should be in fog")
+	}
+	if fogged(n, rpg.Locked, 4) {
+		t.Error("Lv 6 node at Lv 4 is within two levels and should show")
+	}
+	if fogged(n, rpg.Unlocked, 1) {
+		t.Error("only locked nodes are fogged")
+	}
+}
+
+func TestTreeEnterCompletesTheNodesDirective(t *testing.T) {
+	m := newFlowModel(t)
+	m.width, m.height = 160, 40
+	m.skills = []db.Skill{{ID: 1, Name: "Python", Category: "Craft"}}
+	m.nodes = sampleTree()
+	m.openTree()
+
+	m = send(t, m, key("enter"))
+	if m.isLoading || m.statusText != "No directive for this node today." {
+		t.Errorf("no directive: loading=%v status=%q", m.isLoading, m.statusText)
+	}
+
+	m.challenges = []db.Challenge{
+		{ID: 7, SkillName: "Python", NodeName: "Tooling", Title: "Set up ruff"},
+		{ID: 8, SkillName: "python", NodeName: "basics", Title: "Write a REPL session log", XP: 9},
+	}
+	if view := m.View(); !strings.Contains(view, "Write a REPL session log") || !strings.Contains(view, "complete") {
+		t.Error("the inspector should show the node's directive and how to complete it")
+	}
+	m = send(t, m, key("enter"))
+	if !m.isLoading || !strings.Contains(m.loadingText, "Write a REPL session log") {
+		t.Errorf("enter should complete the selected node's directive, loading=%v text=%q", m.isLoading, m.loadingText)
+	}
+	if m.screen != screenTree {
+		t.Error("completing from the tree stays on the tree")
+	}
+	if !strings.Contains(m.renderKeys(), "complete directive") {
+		t.Error("the tree's key bar should list enter")
 	}
 }
 
@@ -212,5 +263,148 @@ func TestFitGeomUsesTheSpace(t *testing.T) {
 	narrow := fitGeom(nodes, 80, 12)
 	if narrow.cardW != minCardW || narrow.rowGap != 1 {
 		t.Errorf("a small window should use the smallest layout, got %+v", narrow)
+	}
+}
+
+// A long error or status must not wrap: an extra terminal row scrolls the
+// skill pills and the tree header off the top.
+func TestLongStatusDoesNotPushTheScreenUp(t *testing.T) {
+	long := strings.Repeat("build roadmap for Go: context deadline exceeded\n", 6)
+	for _, size := range [][2]int{{186, 50}, {120, 30}, {80, 24}} {
+		for _, screen := range []string{"tree", "home", "setup"} {
+			m := newFlowModel(t)
+			m.width, m.height = size[0], size[1]
+			m.updateSizes()
+			m.skills = []db.Skill{{ID: 1, Name: "Python", Category: "Craft"}}
+			m.nodes = sampleTree()
+			switch screen {
+			case "tree":
+				m.openTree()
+			case "setup":
+				m.openOnboard()
+			}
+			m.errorText = long
+			lines := strings.Split(m.View(), "\n")
+			if len(lines) != m.height {
+				t.Errorf("%s %dx%d: %d lines, want %d", screen, m.width, m.height, len(lines), m.height)
+			}
+			for i, l := range lines {
+				if w := lipgloss.Width(l); w > m.width {
+					t.Errorf("%s %dx%d: line %d is %d wide", screen, m.width, m.height, i, w)
+				}
+			}
+			if screen == "tree" && !strings.Contains(lines[0], "Python") {
+				t.Errorf("%dx%d: the skill pills should be the first line, got %q", m.width, m.height, lines[0])
+			}
+		}
+	}
+}
+
+// diamondNodes is the 8-node tree BuildRoadmap shapes, for a skill at start.
+func diamondNodes(start int) []db.Node {
+	parents := []int64{0, 0, 1, 1, 2, 4, 5, 6}
+	levels := map[int][]int{1: {1, 1, 2, 2, 2, 4, 4, 6}, 2: {1, 1, 1, 2, 2, 3, 3, 5}}[start]
+	var out []db.Node
+	for i := range 8 {
+		cost := rpg.NodeXPNeeded(levels[i])
+		out = append(out, db.Node{ID: int64(i + 1), SkillID: 1, ParentID: parents[i],
+			Name: fmt.Sprintf("N%d", i), RequiredLevel: levels[i], XPNeeded: cost,
+			Progress: rpg.StartProgress(levels[i], start, cost)})
+	}
+	return out
+}
+
+func TestLeafNodesExplainThemselves(t *testing.T) {
+	m := newFlowModel(t)
+	m.width, m.height = 186, 50
+	m.skills = []db.Skill{{ID: 1, Name: "Cook", Category: "Craft"}}
+	m.nodes = diamondNodes(1)
+	m.openTree()
+	rows := m.treeRows()
+
+	for i, r := range rows {
+		m.treeNode = i
+		view := m.View()
+		switch r.node.Name {
+		case "N2": // column 2's top node: no children
+			if !strings.Contains(view, "side branch") || !strings.Contains(view, "counts toward Lv 4") {
+				t.Errorf("N2 should be explained as a side branch toward Lv 4")
+			}
+		case "N7":
+			if strings.Contains(view, "capstone") {
+				t.Error("at Lv 1 the capstone is in fog and says nothing")
+			}
+		}
+	}
+
+	// Out of the fog (Lv 5), N7 shows as the end of the tree.
+	m.skills[0].TotalXP = rpg.TotalXPForLevel(5)
+	for i, r := range m.treeRows() {
+		if r.node.Name == "N7" {
+			m.treeNode = i
+		}
+	}
+	if !strings.Contains(m.View(), "capstone") {
+		t.Error("N7 should be marked the capstone")
+	}
+}
+
+func TestGAsksForADirectiveOnAnOpenNode(t *testing.T) {
+	m := newFlowModel(t)
+	m.width, m.height = 186, 50
+	m.skills = []db.Skill{{ID: 1, Name: "Cook", Category: "Craft"}}
+	m.nodes = diamondNodes(1) // N0 and N1 open at Lv 1
+	m.openTree()
+
+	if !strings.Contains(m.renderKeys(), "g new directive") {
+		t.Error("the footer should offer g on an open node without a directive")
+	}
+	if !strings.Contains(m.View(), "No directive for this node today.") {
+		t.Fatal("inspector should say there is no directive")
+	}
+	m = send(t, m, key("g"))
+	if !strings.Contains(m.dailyBusy, "Drafting a directive for N0") {
+		t.Fatalf("g should start a directive for N0, busy=%q", m.dailyBusy)
+	}
+	if !strings.Contains(m.View(), "Drafting a directive for N0") {
+		t.Error("the inspector should show the spinner line")
+	}
+
+	// A locked node is refused, and so is one that already has a directive.
+	m.dailyBusy = ""
+	m.treeNode = 2 // depth-first order: N0, N2, N3, … so row 2 is N3 (locked)
+	if m.treeRows()[2].status != rpg.Locked {
+		t.Fatalf("row 2 should be locked, got %v", m.treeRows()[2].status)
+	}
+	m = send(t, m, key("g"))
+	if m.dailyBusy != "" || !strings.Contains(m.statusText, "locked") {
+		t.Errorf("g on a locked node: busy=%q status=%q", m.dailyBusy, m.statusText)
+	}
+	if strings.Contains(m.renderKeys(), "g new directive") {
+		t.Error("g should not be offered on a locked node")
+	}
+
+	m.treeNode = 0
+	m.challenges = []db.Challenge{{ID: 1, Tier: rpg.TierFocus, SkillName: "Cook", NodeName: "N0", Title: "Dice an onion"}}
+	m = send(t, m, key("g"))
+	if m.dailyBusy != "" || !strings.Contains(m.statusText, "already has a directive") {
+		t.Errorf("g on a node with a directive: busy=%q status=%q", m.dailyBusy, m.statusText)
+	}
+}
+
+// Focus directives from the tree do not count as the day's set, so g on
+// the home screen still generates it.
+func TestFocusDirectivesAreNotTheDailySet(t *testing.T) {
+	m := newFlowModel(t)
+	m.challenges = []db.Challenge{{ID: 1, Tier: rpg.TierFocus, SkillName: "Cook", NodeName: "N0", Title: "Dice an onion", Done: true}}
+	if m.dailyKeyLabel() != "generate" {
+		t.Errorf("g label = %q, want generate", m.dailyKeyLabel())
+	}
+	if !strings.Contains(m.View(), "generate today's set") {
+		t.Error("the panel should point at g for the set")
+	}
+	m = send(t, m, key("g"))
+	if m.dailyBusy != "Generating…" {
+		t.Errorf("g should generate the set, busy=%q", m.dailyBusy)
 	}
 }

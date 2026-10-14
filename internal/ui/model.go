@@ -27,10 +27,8 @@ const (
 	screenRoad
 	screenOnboard
 	screenTree
-	screenDaily
 	screenHelp
 	screenSkillEdit
-	screenDailyPick
 )
 
 // newPlanForm holds the inputs of the New Plan window.
@@ -44,7 +42,8 @@ type newPlanForm struct {
 
 type model struct {
 	screen          screen
-	prevScreen      screen // screen to return to when the model picker closes
+	prevScreen      screen // screen under help, the skill editor or New Plan
+	modelsReturn    screen // screen the model picker was opened from
 	newPlan         newPlanForm
 	spinner         spinner.Model
 	isLoading       bool
@@ -69,10 +68,7 @@ type model struct {
 	onboard         onboardForm
 	skillEdit       skillEditForm
 	helpTab         int
-	dailyOpening    bool
-	dailyDefault    int
-	dailyPickSize   int
-	dailyPickRenew  bool
+	dailyBusy       string // set while the model works on today's directives
 	onboardChecked  bool
 	modelsList      list.Model
 	models          []string
@@ -158,7 +154,7 @@ func newListDelegate() list.DefaultDelegate {
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(loadPlansCmd(m.store), loadModelsCmd(m.client), loadRoadCmd(m.store),
-		loadDailyCmd(m.client, m.store, dailyLoad, 0))
+		loadDailyCmd(m.store))
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -174,8 +170,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case spinner.TickMsg:
 		// Stop the animation once nothing is running. A skill audit on the
-		// setup screen runs without blocking it, so it keeps the spinner too.
-		if !m.isLoading && !m.onboard.auditing() {
+		// setup screen and a directive job run without blocking the screen,
+		// so they keep the spinner too.
+		if !m.isLoading && !m.onboard.busy() && m.dailyBusy == "" {
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -259,38 +256,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusText = "Saved " + msg.name + ". It is back at level 1."
 		return m, loadRoadCmd(m.store)
 	case auditDoneMsg:
-		m.applyAudit(msg)
+		cmd := m.applyAudit(msg)
+		return m, cmd
+	case categoryDoneMsg:
+		m.applyCategory(msg)
 		return m, nil
-	case onboardingDoneMsg:
-		m.isLoading = false
-		if msg.err != nil {
-			m.errorText = msg.err.Error()
-			return m, nil
-		}
-		m.errorText = ""
-		m.screen = screenMain
-		m.statusText = fmt.Sprintf("Character created with %d skill tree%s.", msg.count, plural(msg.count))
-		return m, tea.Batch(loadRoadCmd(m.store), loadDailyCmd(m.client, m.store, dailyLoad, 0))
+	case treeBuiltMsg:
+		return m.handleTreeBuilt(msg)
 	case challengesLoadedMsg:
-		m.isLoading = false
+		m.dailyBusy = ""
+		// A failed job still carries today's list as it stands.
+		if msg.challenges != nil || msg.err == nil {
+			m.challenges = msg.challenges
+			m.challengeStats = msg.stats
+			m.challengeCursor = clamp(m.challengeCursor, 0, max(len(msg.challenges)-1, 0))
+		}
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
 			return m, nil
 		}
-		m.errorText = ""
-		m.challenges = msg.challenges
-		m.challengeStats = msg.stats
-		m.challengeCursor = clamp(m.challengeCursor, 0, max(len(msg.challenges)-1, 0))
-		if msg.count > 0 {
-			m.dailyDefault = msg.count
-		}
-		// Opening the popup on a day with no set asks how many to make.
-		if m.dailyOpening {
-			m.dailyOpening = false
-			if len(msg.challenges) == 0 && m.screen == screenDaily {
-				cmd := m.openDailyPicker(false)
-				return m, cmd
-			}
+		if msg.note != "" {
+			m.errorText = ""
+			m.statusText = msg.note
 		}
 		return m, nil
 	case challengeDoneMsg:
@@ -304,7 +291,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusText += " › " + msg.event.NodeName
 		}
 		m.statusText += comebackNote(msg.event)
-		return m, tea.Batch(loadDailyCmd(m.client, m.store, dailyLoad, 0), loadRoadCmd(m.store))
+		return m, tea.Batch(loadDailyCmd(m.store), loadRoadCmd(m.store))
 	case editorFinishedMsg:
 		return m.handleEditorFinished(msg)
 	}
