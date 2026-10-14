@@ -5,8 +5,8 @@ const bottomBarH = 3
 
 // Outer heights (borders included) of the centered windows.
 const (
-	newPlanPanelH = 16
-	newPlanTextH  = 8
+	newPlanPanelH = 18
+	newPlanTextH  = 6
 	modelPanelH   = 14
 )
 
@@ -16,17 +16,14 @@ func (m model) bodyHeight() int {
 }
 
 // columnWidths returns the plan list width and the preview width.
+// columnWidths returns the left column (directives and plans) and right
+// panel widths on the home screen. The left column is wide enough for a
+// directive's title, skill and XP on one line.
 func (m model) columnWidths() (int, int) {
 	if m.width == 0 {
 		return 38, 62
 	}
-	left := m.width / 3
-	if left < 30 {
-		left = 30
-	}
-	if left > 45 {
-		left = 45
-	}
+	left := clamp(m.width*2/5, 34, 64)
 	return left, m.width - left
 }
 
@@ -46,15 +43,17 @@ func clamp(v, lo, hi int) int {
 
 // updateSizes resizes every component to match the current terminal size.
 func (m *model) updateSizes() {
+	m.sizeOnboardInputs()
 	leftW, _ := m.columnWidths()
-	bodyH := m.bodyHeight()
-	m.plansList.SetSize(max(leftW-2, 10), max(bodyH-2, 2))
+	_, _, plansH := m.homeHeights()
+	m.plansList.SetSize(max(leftW-2, 10), max(plansH-2, 2))
 
 	formW, _ := m.newPlanSize()
-	// The subject input draws a 2-cell prompt and a cursor cell on top of
-	// Width, so reserve room for both inside the window's inner width.
-	m.newPlan.subject.Width = max(formW-7, 15)
-	m.newPlan.description.SetWidth(max(formW-4, 15))
+	// Each input sits in a bordered box with one cell of padding, inside the
+	// panel's own border. The subject also has a 2-cell prompt and a cursor.
+	boxW := max(formW-4, 15)
+	m.newPlan.subject.Width = max(boxW-4-3, 10)
+	m.newPlan.description.SetWidth(max(boxW-4, 10))
 
 	pickW, pickH := m.modelPanelSize()
 	m.modelsList.SetSize(max(pickW-2, 10), max(pickH-2, 2))

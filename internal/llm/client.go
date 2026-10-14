@@ -117,7 +117,7 @@ func (c *Client) GenerateDescription(ctx context.Context, subject string, detail
 	}{
 		Model:  c.Model(),
 		Prompt: prompt,
-		System: "You are a helpful planner. Respond with markdown only.",
+		System: "You are a expert in planing everything and can help like a teacher. Respond with markdown only.",
 		Stream: false,
 	}
 

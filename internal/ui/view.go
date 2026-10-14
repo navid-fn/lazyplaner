@@ -12,13 +12,19 @@ func (m model) View() string {
 	}
 
 	bodyH := m.bodyHeight()
-	leftW, rightW := m.columnWidths()
 
-	listPanel := panel("Plans", m.plansList.View(), leftW, bodyH, m.screen == screenMain && !m.isEditing)
-	previewPanel := panel("Preview", m.renderPreview(rightW-2), rightW, bodyH, m.isEditing)
-	body := lipgloss.JoinHorizontal(lipgloss.Top, listPanel, previewPanel)
+	// Help and the skill editor are drawn over the screen that opened them.
+	base := m
+	if m.screen == screenHelp || m.screen == screenSkillEdit || m.screen == screenDaily {
+		base.screen = m.prevScreen
+	}
+	if m.screen == screenDailyPick {
+		// The picker is a small popup on the plan list of its own.
+		base.screen = screenMain
+	}
+	body := base.baseBody()
 
-	// Popups are drawn over the plan screen, which stays visible around them.
+	// Popups are drawn over the screen, which stays visible around them.
 	switch {
 	case m.confirmDelete != nil:
 		body = overlay(body, m.renderDeletePopup(), m.width, bodyH)
@@ -30,9 +36,30 @@ func (m model) View() string {
 			body = overlay(body, m.renderNewPlan(), m.width, bodyH)
 		}
 		body = overlay(body, m.renderModelPicker(), m.width, bodyH)
+	case m.screen == screenHelp:
+		body = overlay(body, m.renderHelp(), m.width, bodyH)
+	case m.screen == screenSkillEdit:
+		body = overlay(body, m.renderSkillEdit(), m.width, bodyH)
+	case m.screen == screenDaily:
+		body = overlay(body, m.renderDailyPopup(), m.width, bodyH)
+	case m.screen == screenDailyPick:
+		body = overlay(body, m.renderDailyPicker(), m.width, bodyH)
 	}
 
 	return body + "\n" + m.renderBottomBar()
+}
+
+// baseBody draws the screen for m.screen, without popups.
+func (m model) baseBody() string {
+	switch m.screen {
+	case screenRoad:
+		return m.renderRoadScreen()
+	case screenTree, screenSkillEdit:
+		return m.renderTreeScreen()
+	case screenOnboard:
+		return m.renderOnboardScreen()
+	}
+	return m.renderHome()
 }
 
 func (m model) renderDeletePopup() string {
@@ -45,31 +72,6 @@ func (m model) renderDeletePopup() string {
 
 	// Lines: title, blank, subject, blank, hint, plus the two borders.
 	return panel("Confirm", b.String(), w, 7, true)
-}
-
-func (m model) renderNewPlan() string {
-	w, h := m.newPlanSize()
-
-	subLabel := stDim.Render("Subject")
-	descLabel := stDim.Render("Description")
-	if m.newPlan.descFocused {
-		descLabel = stActive.Render("Description")
-	} else {
-		subLabel = stActive.Render("Subject")
-	}
-
-	var b strings.Builder
-	b.WriteString(subLabel + "\n")
-	b.WriteString(m.newPlan.subject.View() + "\n\n")
-	b.WriteString(descLabel + "\n")
-	b.WriteString(m.newPlan.description.View() + "\n\n")
-	if m.isLoading {
-		b.WriteString(m.spinner.View() + " " + stActive.Render(m.loadingText))
-	} else {
-		b.WriteString(stDim.Render("tab switch field · ctrl+s generate · esc cancel"))
-	}
-
-	return panel("New Plan", b.String(), w, h, true)
 }
 
 func (m model) renderModelPicker() string {
@@ -143,12 +145,41 @@ func (m model) renderKeys() string {
 		}
 	case screenModels:
 		pairs = []kd{{"↑↓", "navigate"}, {"enter", "select"}, {"r", "refresh"}, {"esc", "close"}}
+	case screenRoad:
+		pairs = []kd{{"hjkl ←↑↓→", "move"}, {"enter", "open tree"}, {"?", "help"}, {"c", "back"}, {"q", "quit"}}
+	case screenTree:
+		pairs = []kd{{"←→ hl", "skill"}, {"↑↓ jk", "node"}, {"e", "edit"}, {"?", "help"}, {"t", "back"}, {"q", "quit"}}
+	case screenDailyPick:
+		pairs = []kd{{"←→", "count"}, {"enter", "generate"}, {"esc", "back"}}
+	case screenDaily:
+		if m.isLoading {
+			pairs = []kd{{"ctrl+c", "quit"}}
+		} else {
+			pairs = []kd{{"↑↓", "move"}, {"enter", "tick off"}, {"g", "close"}}
+			if canRenew(m.challenges) {
+				pairs = append([]kd{{"r", "new set"}}, pairs...)
+			}
+		}
+	case screenOnboard:
+		if m.isLoading {
+			pairs = []kd{{"ctrl+c", "quit"}}
+		} else {
+			pairs = []kd{{"tab", "next field"}, {"enter", "add/save"}, {"↑↓", "pick (list)"}, {"ctrl+d", "remove"}, {"ctrl+s", "build"}, {"?", "help"}, {"esc", "skip"}}
+		}
+	case screenHelp:
+		pairs = []kd{{"←→", "section"}, {"esc", "close"}}
+	case screenSkillEdit:
+		pairs = []kd{{"enter", "save"}, {"esc", "cancel"}}
 	default:
 		if m.confirmDelete != nil {
 			pairs = []kd{{"y", "delete"}, {"any key", "cancel"}}
 			break
 		}
-		pairs = []kd{{"ctrl+n", "new plan"}, {"↑↓", "navigate"}, {"e", "edit plan"}, {"d", "delete plan"}, {"ctrl+o", "model"}, {"q", "quit"}}
+		if m.mainFocus == focusDirectives {
+			pairs = []kd{{"tab", "plans"}, {"↑↓", "move"}, {"enter", "complete"}, {"g", "daily"}, {"ctrl+n", "new plan"}, {"c", "character"}, {"t", "tree"}, {"s", "setup"}, {"h", "help"}, {"q", "quit"}}
+		} else {
+			pairs = []kd{{"tab", "directives"}, {"↑↓", "navigate"}, {"ctrl+n", "new plan"}, {"e", "edit plan"}, {"d", "delete plan"}, {"c", "character"}, {"t", "tree"}, {"g", "daily"}, {"h", "help"}, {"ctrl+o", "model"}, {"q", "quit"}}
+		}
 	}
 
 	sep := stSep.Render("  │  ")

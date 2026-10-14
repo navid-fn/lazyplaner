@@ -18,6 +18,20 @@ func (m model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleNewPlanKey(msg)
 	case screenModels:
 		return m.handleModelsKey(msg)
+	case screenRoad:
+		return m.handleRoadKey(msg)
+	case screenOnboard:
+		return m.handleOnboardKey(msg)
+	case screenTree:
+		return m.handleTreeKey(msg)
+	case screenDaily:
+		return m.handleDailyKey(msg)
+	case screenHelp:
+		return m.handleHelpKey(msg)
+	case screenSkillEdit:
+		return m.handleSkillEditKey(msg)
+	case screenDailyPick:
+		return m.handleDailyPickKey(msg)
 	}
 	return m.handleMainKey(msg)
 }
@@ -25,6 +39,9 @@ func (m model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.confirmDelete != nil {
 		return m.handleDeleteConfirmKey(msg)
+	}
+	if next, cmd, handled := m.handleHomeKey(msg); handled {
+		return next, cmd
 	}
 
 	switch msg.String() {
@@ -48,12 +65,38 @@ func (m model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case "ctrl+o":
 		return m.openModels()
+	case "c":
+		cmd := m.openRoad()
+		return m, cmd
+	case "t":
+		m.openTree()
+		return m, nil
+	case "g":
+		if m.isLoading {
+			return m, nil
+		}
+		cmd := m.openDaily()
+		return m, cmd
+	case "s":
+		if m.isLoading {
+			return m, nil
+		}
+		cmd := m.openOnboard()
+		return m, cmd
+	case "h":
+		m.openHelp()
+		return m, nil
 	case "e":
 		if !m.isLoading {
 			return m.handleEditStart()
 		}
 	}
 
+	// Only the plan list moves with the remaining keys, and only when it
+	// has focus.
+	if m.mainFocus != focusPlans {
+		return m, nil
+	}
 	var cmd tea.Cmd
 	m.plansList, cmd = m.plansList.Update(msg)
 	return m, cmd
@@ -75,7 +118,7 @@ func (m model) handleDeleteConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if m.screen != screenMain || m.isEditing {
+	if m.screen != screenMain || m.isEditing || m.mainFocus != focusPlans {
 		return m, nil
 	}
 	var cmd tea.Cmd

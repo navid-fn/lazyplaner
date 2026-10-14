@@ -14,21 +14,40 @@ func formatPlanDate(t time.Time) string {
 }
 
 func (m *model) setPlans(plans []db.Plan) {
-	items := make([]list.Item, 0, len(plans))
 	m.plansByID = map[int64]db.Plan{}
 	m.plans = plans
 	for _, plan := range plans {
 		m.plansByID[plan.ID] = plan
+	}
+	m.plansList.SetItems(m.planItems())
+	if len(plans) > 0 {
+		m.plansList.Select(0)
+	}
+}
+
+// refreshPlanItems rebuilds the list rows, for example after new XP events
+// change the badges, keeping the selected row.
+func (m *model) refreshPlanItems() {
+	selected := m.plansList.Index()
+	m.plansList.SetItems(m.planItems())
+	if n := len(m.plans); n > 0 {
+		m.plansList.Select(clamp(selected, 0, n-1))
+	}
+}
+
+// planItems builds a list row per plan, each with its XP badge if any.
+func (m model) planItems() []list.Item {
+	badges := m.planBadges()
+	items := make([]list.Item, 0, len(m.plans))
+	for _, plan := range m.plans {
 		items = append(items, planItem{
 			id:      plan.ID,
 			subject: plan.Subject,
 			created: formatPlanDate(plan.CreatedAt),
+			badge:   badges[plan.ID],
 		})
 	}
-	m.plansList.SetItems(items)
-	if len(items) > 0 {
-		m.plansList.Select(0)
-	}
+	return items
 }
 
 // modelNamesMatch compares model names ignoring an implicit ":latest" tag,

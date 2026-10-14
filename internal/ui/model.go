@@ -24,6 +24,13 @@ const (
 	screenMain screen = iota
 	screenNewPlan
 	screenModels
+	screenRoad
+	screenOnboard
+	screenTree
+	screenDaily
+	screenHelp
+	screenSkillEdit
+	screenDailyPick
 )
 
 // newPlanForm holds the inputs of the New Plan window.
@@ -36,29 +43,48 @@ type newPlanForm struct {
 // ─── Model ───────────────────────────────────────────────────────────────────
 
 type model struct {
-	screen        screen
-	prevScreen    screen // screen to return to when the model picker closes
-	newPlan       newPlanForm
-	spinner       spinner.Model
-	isLoading     bool
-	loadingText   string
-	statusText    string
-	errorText     string
-	confirmDelete *db.Plan
-	plansList     list.Model
-	plansByID     map[int64]db.Plan
-	plans         []db.Plan
-	modelsList    list.Model
-	models        []string
-	selectedModel string
-	isEditing     bool
-	editTempPath  string
-	editPlanID    int64
-	editOriginal  string
-	width         int
-	height        int
-	store         *db.Store
-	client        *llm.Client
+	screen          screen
+	prevScreen      screen // screen to return to when the model picker closes
+	newPlan         newPlanForm
+	spinner         spinner.Model
+	isLoading       bool
+	loadingText     string
+	statusText      string
+	errorText       string
+	confirmDelete   *db.Plan
+	plansList       list.Model
+	plansByID       map[int64]db.Plan
+	plans           []db.Plan
+	skills          []db.Skill
+	nodes           []db.Node
+	xpEvents        []db.XPEvent
+	challenges      []db.Challenge
+	challengeStats  db.ChallengeStats
+	challengeCursor int
+	treeSkill       int
+	treeNode        int
+	charCursor      int
+	mainFocus       homeFocus // which left panel on the home screen has keys
+	treeReturn      screen    // where leaving the tree goes back to
+	onboard         onboardForm
+	skillEdit       skillEditForm
+	helpTab         int
+	dailyOpening    bool
+	dailyDefault    int
+	dailyPickSize   int
+	dailyPickRenew  bool
+	onboardChecked  bool
+	modelsList      list.Model
+	models          []string
+	selectedModel   string
+	isEditing       bool
+	editTempPath    string
+	editPlanID      int64
+	editOriginal    string
+	width           int
+	height          int
+	store           *db.Store
+	client          *llm.Client
 }
 
 // ─── Constructor ─────────────────────────────────────────────────────────────
@@ -131,7 +157,8 @@ func newListDelegate() list.DefaultDelegate {
 // ─── Init / Update ───────────────────────────────────────────────────────────
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(loadPlansCmd(m.store), loadModelsCmd(m.client))
+	return tea.Batch(loadPlansCmd(m.store), loadModelsCmd(m.client), loadRoadCmd(m.store),
+		loadDailyCmd(m.client, m.store, dailyLoad, 0))
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -146,8 +173,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateSizes()
 		return m, nil
 	case spinner.TickMsg:
-		// Stop the animation once nothing is running.
-		if !m.isLoading {
+		// Stop the animation once nothing is running. A skill audit on the
+		// setup screen runs without blocking it, so it keeps the spinner too.
+		if !m.isLoading && !m.onboard.auditing() {
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -175,12 +203,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.errorText = ""
-		m.statusText = "Plan saved."
+		m.statusText = planSavedStatus(msg)
 		m.newPlan.subject.Reset()
 		m.newPlan.description.Reset()
 		m.closeNewPlan()
 		m.setPlans(append([]db.Plan{msg.plan}, m.plans...))
-		return m, nil
+		// Reload the character so the new plan's badge and the briefing
+		// show the XP it just earned.
+		return m, loadRoadCmd(m.store)
 	case planUpdatedMsg:
 		m.isLoading = false
 		if msg.err != nil {
@@ -201,6 +231,80 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusText = "Plan deleted."
 		m.removePlan(msg.id)
 		return m, nil
+	case roadLoadedMsg:
+		if msg.err != nil {
+			m.errorText = msg.err.Error()
+			return m, nil
+		}
+		m.setRoad(msg.skills, msg.nodes, msg.events)
+		m.challengeStats = msg.stats
+		m.refreshPlanItems()
+		// Setup opens on the first load when there is no character yet.
+		if !m.onboardChecked {
+			m.onboardChecked = true
+			if len(msg.skills) == 0 {
+				cmd := m.openOnboard()
+				return m, cmd
+			}
+		}
+		return m, nil
+	case skillUpdatedMsg:
+		m.isLoading = false
+		if msg.err != nil {
+			m.errorText = msg.err.Error()
+			return m, nil
+		}
+		m.screen = screenTree
+		m.errorText = ""
+		m.statusText = "Saved " + msg.name + ". It is back at level 1."
+		return m, loadRoadCmd(m.store)
+	case auditDoneMsg:
+		m.applyAudit(msg)
+		return m, nil
+	case onboardingDoneMsg:
+		m.isLoading = false
+		if msg.err != nil {
+			m.errorText = msg.err.Error()
+			return m, nil
+		}
+		m.errorText = ""
+		m.screen = screenMain
+		m.statusText = fmt.Sprintf("Character created with %d skill tree%s.", msg.count, plural(msg.count))
+		return m, tea.Batch(loadRoadCmd(m.store), loadDailyCmd(m.client, m.store, dailyLoad, 0))
+	case challengesLoadedMsg:
+		m.isLoading = false
+		if msg.err != nil {
+			m.errorText = msg.err.Error()
+			return m, nil
+		}
+		m.errorText = ""
+		m.challenges = msg.challenges
+		m.challengeStats = msg.stats
+		m.challengeCursor = clamp(m.challengeCursor, 0, max(len(msg.challenges)-1, 0))
+		if msg.count > 0 {
+			m.dailyDefault = msg.count
+		}
+		// Opening the popup on a day with no set asks how many to make.
+		if m.dailyOpening {
+			m.dailyOpening = false
+			if len(msg.challenges) == 0 && m.screen == screenDaily {
+				cmd := m.openDailyPicker(false)
+				return m, cmd
+			}
+		}
+		return m, nil
+	case challengeDoneMsg:
+		m.isLoading = false
+		if msg.err != nil {
+			m.errorText = msg.err.Error()
+			return m, nil
+		}
+		m.statusText = fmt.Sprintf("+%d XP to %s", msg.event.XP, msg.event.SkillName)
+		if msg.event.NodeName != "" {
+			m.statusText += " › " + msg.event.NodeName
+		}
+		m.statusText += comebackNote(msg.event)
+		return m, tea.Batch(loadDailyCmd(m.client, m.store, dailyLoad, 0), loadRoadCmd(m.store))
 	case editorFinishedMsg:
 		return m.handleEditorFinished(msg)
 	}

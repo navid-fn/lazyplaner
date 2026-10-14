@@ -25,12 +25,44 @@ Settings come from environment variables (see `internal/config`):
 | `ctrl+o`   | Select the model used for generation    |
 | `e`        | Edit the selected plan in `$EDITOR`     |
 | `d`        | Delete the selected plan (asks `y` to confirm) |
+| `c`        | Character sheet and road (skills, level, XP history) |
+| `t`        | Skill tree for each skill (←/→ switches skill, `e` edits it) |
+| `g`        | Daily challenges (↑↓ move, enter ticks one off). The first set of the day asks how many (1 to 5); `r` asks again for a new set once all are done |
+| `s`        | Character setup (start skills and levels) |
+| `h`        | Help: what you can type, levels, categories, plans, keys (←/→ switches section) |
 | `↑` / `↓`  | Move through the plan list              |
 | `q`        | Quit                                    |
 
 In the New Plan window: `tab` switches fields, `enter` moves from subject to
 description, `ctrl+s` generates the plan, and `esc` cancels. In the model
 picker: `enter` selects, `r` refreshes, and `esc` closes.
+
+## Creating your character
+
+On first start (or with `s`) the setup screen asks for your starting skills.
+Press `?` there for the same help in the app.
+
+**Add a skill you practise or want to build**, such as `Go`, `Running`,
+`Drawing`, or `Public speaking`.
+
+- 1 to 3 words, up to 40 characters.
+- Letters, numbers, spaces, and `+ # . - / & '` only (`C++`, `CI/CD`, `R&D`).
+- Skills can't repeat. `Go` and `go` are the same skill.
+- Up to 8 skills per setup. Add more later with `s`.
+
+**Don't add** goals or sentences (`get fit by June` → use `Fitness`), one-off
+tasks (`buy milk` belongs in a plan), or emoji and symbols like `! ? @ %`.
+
+Each skill gets a tree built from basics to advanced. The level you pick
+(1 Beginner to 5 Expert) is where you start on that tree. The AI chooses the
+skill's category (Mind, Body, Craft, Social or Life) when it builds the tree,
+so you don't pick one.
+
+**Editing.** In setup, tab to the list, pick a skill with `↑/↓`, and press
+enter to change it. `ctrl+d` removes the selected skill. On the tree screen,
+`e` renames a skill. Saving that edit resets the
+skill to level 1: its XP and node progress go to 0. The XP history and the
+tree are kept.
 
 ## Project layout
 
