@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -21,9 +22,9 @@ const (
 
 // Sizes on the home screen, in terminal cells.
 const (
-	hudH          = 1 // the character HUD above the panels
-	directivesMax = 9 // borders, progress line, four directives, the bonus and a footer
-	recentXPCount = 3 // awards shown in the briefing's feed
+	hudH          = 1  // the character HUD above the panels
+	directivesMax = 11 // borders, progress line, six rows (or five and "more"), and a footer
+	recentXPCount = 3  // awards shown in the briefing's feed
 )
 
 // homeHeights splits the body: the HUD line, then the panels. The left
@@ -124,11 +125,21 @@ func (m model) renderHUD() string {
 		gradientBar(p.Fraction, 16, string(colorActive), "#00e5ff") +
 		stDim.Render(fmt.Sprintf(" %d/%d xp", p.Into, p.Span))
 
+	streak := fmt.Sprintf("🔥 Streak: %dd", st.Streak)
+	if st.TodayShielded {
+		streak = fmt.Sprintf("🛡️ Streak: %dd", st.Streak)
+	}
 	sep := stSep.Render("  │  ")
+	activeText := stActive.Render(fmt.Sprintf("⚔️ Active: %d/%d", active, rpg.MaxActiveSkills))
+	if active > rpg.MaxActiveSkills {
+		// Older characters may have more; c then f freezes one.
+		activeText = lipgloss.NewStyle().Foreground(lipgloss.Color(inkRusty)).Bold(true).
+			Render(fmt.Sprintf("⚔️ Active: %d/%d", active, rpg.MaxActiveSkills))
+	}
 	stats := []string{
-		stActive.Render(fmt.Sprintf("⚔️ Active: %d", active)),
+		activeText,
 		lipgloss.NewStyle().Foreground(colorKeyLabel).Render(fmt.Sprintf("🎯 Today: %d/%d", st.Done, st.Total)),
-		lipgloss.NewStyle().Foreground(lipgloss.Color(inkRusty)).Render(fmt.Sprintf("🔥 Streak: %dd", st.Streak)),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(inkRusty)).Render(streak),
 		stSuccess.Render(fmt.Sprintf("★ Score: %d", st.Score)),
 	}
 	if rusty > 0 {
@@ -176,39 +187,79 @@ func (m model) renderDirectives(width, height int) string {
 	lines := []string{" " + gradientBar(float64(done)/float64(len(m.challenges)), barW,
 		string(colorActive), string(colorSuccess)) + summary}
 
-	for i, c := range m.challenges {
-		pointer := "  "
-		if focused && i == m.challengeCursor {
-			pointer = stActive.Render("▸ ")
-		}
-		box, name := stDim.Render("[ ]"), stActive.Render(c.Title)
-		if c.Done {
-			box, name = stSuccess.Render("[✓]"), stDim.Strikethrough(true).Render(c.Title)
-		}
-		xp := " " + categoryStyle(c.Category).Render(truncRunes(c.SkillName, 10)) +
-			stSuccess.Render(fmt.Sprintf(" +%d", c.XP)) + " "
-		left := pointer + box + " "
-		if chip := tierChip(c.Tier); chip != "" {
-			left += chip + " "
-		}
-		room := max(inner-lipgloss.Width(left)-lipgloss.Width(xp), 4)
-		name = ansi.Truncate(name, room, "…")
-		gap := max(room-lipgloss.Width(name), 0)
-		lines = append(lines, left+name+strings.Repeat(" ", gap)+xp)
-	}
-
 	// Without a set (only focus directives from the tree), point at g;
 	// once the set is done, say whether the day's one bonus is left.
+	var footer []string
 	if !hasSet(m.challenges) && m.dailyBusy == "" {
-		lines = append(lines, ansi.Truncate(" "+stChip.Render(" g ")+stDim.Render(" generate today's set"), inner, "…"))
+		footer = append(footer, ansi.Truncate(" "+stChip.Render(" g ")+stDim.Render(" generate today's set"), inner, "…"))
 	} else if done == len(m.challenges) && m.dailyBusy == "" {
-		footer := stSuccess.Render(" ★ Set complete ") + stChip.Render(" g ") + stDim.Render(" 1 bonus")
+		f := stSuccess.Render(" ★ Set complete ") + stChip.Render(" g ") + stDim.Render(" 1 bonus")
 		if bonusUsed(m.challenges) {
-			footer = stSuccess.Render(" ★ Daily cap reached") + stDim.Render(" · new directives tomorrow")
+			f = stSuccess.Render(" ★ Daily cap reached") + stDim.Render(" · new directives tomorrow")
 		}
-		lines = append(lines, ansi.Truncate(footer, inner, "…"))
+		footer = append(footer, ansi.Truncate(f, inner, "…"))
 	}
+
+	// The rows scroll with the cursor when they outgrow the panel; one line
+	// then says what is hidden.
+	room := max(height-2-len(lines)-len(footer), 1)
+	from, to := listWindow(len(m.challenges), m.challengeCursor, room)
+	if to-from < len(m.challenges) {
+		from, to = listWindow(len(m.challenges), m.challengeCursor, max(room-1, 1))
+	}
+	for i := from; i < to; i++ {
+		lines = append(lines, m.directiveRow(m.challenges[i], focused && i == m.challengeCursor, inner))
+	}
+	if to-from < len(m.challenges) {
+		arrows := ""
+		if from > 0 {
+			arrows += "↑"
+		}
+		if to < len(m.challenges) {
+			arrows += "↓"
+		}
+		lines = append(lines, stDim.Render(fmt.Sprintf("  %s more (%d/%d)", arrows,
+			clamp(m.challengeCursor, 0, len(m.challenges)-1)+1, len(m.challenges))))
+	}
+	lines = append(lines, footer...)
 	return panel(title, strings.Join(lines, "\n"), width, height, focused)
+}
+
+// directiveRow is one compact row of the day's list: the box ([ ], [▶]
+// started, [✓] done), the tier icon, the short title, and the skill with
+// its XP on the right.
+func (m model) directiveRow(c db.Challenge, selected bool, inner int) string {
+	pointer := "  "
+	if selected {
+		pointer = stActive.Render("▸ ")
+	}
+	box, name := stDim.Render("[ ]"), stActive.Render(c.Title)
+	switch {
+	case c.Done:
+		box, name = stSuccess.Render("[✓]"), stDim.Strikethrough(true).Render(c.Title)
+	case c.Started():
+		box = lipgloss.NewStyle().Foreground(colorKeyLabel).Bold(true).Render("[▶]")
+	}
+	xp := " " + categoryStyle(c.Category).Render(truncRunes(c.SkillName, 10)) +
+		stSuccess.Render(fmt.Sprintf(" +%d", c.XP)) + " "
+	left := pointer + box + " "
+	if icon := tierIcon(c.Tier); icon != "" {
+		left += icon + " "
+	}
+	room := max(inner-lipgloss.Width(left)-lipgloss.Width(xp), 4)
+	name = ansi.Truncate(name, room, "…")
+	gap := max(room-lipgloss.Width(name), 0)
+	return left + name + strings.Repeat(" ", gap) + xp
+}
+
+// listWindow is the slice [from, to) of n rows to show in room lines so the
+// cursor stays in view, centered once the list scrolls.
+func listWindow(n, cursor, room int) (from, to int) {
+	if n <= room {
+		return 0, n
+	}
+	from = clamp(cursor-room/2, 0, n-room)
+	return from, from + room
 }
 
 // renderPlansPanel is the plan list, or a hint when there are no plans.
@@ -225,13 +276,13 @@ func (m model) renderPlansPanel(width, height int) string {
 // ─── Briefing ────────────────────────────────────────────────────────────────
 
 // renderBriefing fills the right panel: active skills on top, the selected
-// directive or plan, each skill's next move, and the latest XP at the bottom.
+// directive with its execution guide, and the latest XP at the bottom.
 func (m model) renderBriefing(width, height int) string {
 	feed := m.briefingFeed(width)
 	top := append(m.briefingSkills(width, max(height/3, 3)), "")
 	top = append(top, m.briefingSelected(width)...)
 	top = append(top, "")
-	top = append(top, m.briefingNextMoves(width)...)
+	top = append(top, m.briefingGuide(width)...)
 
 	// The feed sits at the bottom; the details give way if space is short.
 	room := max(height-len(feed)-1, 0)
@@ -301,11 +352,21 @@ func (m model) briefingSelected(width int) []string {
 	}
 
 	c := m.challenges[m.challengeCursor]
+	var badge string
 	if c.Tier == rpg.TierOvertime {
-		lines = append(lines, " "+stSuccess.Bold(true).Render("★ Bonus Overtime Directive"))
+		badge = stSuccess.Bold(true).Render("★ Bonus Overtime Directive")
 	} else if c.Tier != rpg.TierNone {
-		lines = append(lines, " "+lipgloss.NewStyle().Foreground(colorKeyLabel).Render("["+c.Tier.Label()+"]"))
+		badge = lipgloss.NewStyle().Foreground(colorKeyLabel).Render("[" + c.Tier.Label() + "]")
 	}
+	switch {
+	case c.Done:
+	case c.Started():
+		badge += "   " + lipgloss.NewStyle().Foreground(colorKeyLabel).Bold(true).
+			Render("▶ "+elapsedLabel(time.Since(c.StartedAt))) + stDim.Render("  enter finishes")
+	default:
+		badge += "   " + stDim.Render("enter starts the clock")
+	}
+	lines = append(lines, ansi.Truncate(" "+strings.TrimSpace(badge), width, "…"))
 	title := stActive.Render(c.Title)
 	if c.Done {
 		title = stSuccess.Render("✓ " + c.Title)
@@ -333,6 +394,9 @@ func (m model) briefingSelected(width int) []string {
 	if desc == "" {
 		desc = "No description."
 	}
+	if c.Done && c.CompletionNote != "" {
+		desc += "\n✓ " + c.CompletionNote
+	}
 	lines = append(lines, "")
 	for _, l := range strings.Split(lipgloss.NewStyle().Width(width-2).Render(desc), "\n") {
 		lines = append(lines, " "+lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(l))
@@ -340,27 +404,58 @@ func (m model) briefingSelected(width int) []string {
 	return lines
 }
 
-// briefingNextMoves says, per active skill, what to do next: clear its rust,
-// or reach the level that opens its next node.
-func (m model) briefingNextMoves(width int) []string {
-	lines := []string{sectionHeader("🧭  Next Moves", "", width)}
-	const nameW = 14
-	shown := 0
-	for _, sk := range m.skills {
-		if !sk.IsActive {
+// briefingGuide is the selected directive's execution guide: its steps,
+// the key concepts or commands, and how to check it is done.
+func (m model) briefingGuide(width int) []string {
+	lines := []string{sectionHeader("📋  Execution Guide", "", width)}
+	if m.mainFocus != focusDirectives || m.challengeCursor >= len(m.challenges) {
+		return append(lines, " "+stDim.Render("Select a directive to see how to do it."))
+	}
+	c := m.challenges[m.challengeCursor]
+	if strings.TrimSpace(c.Details) == "" {
+		return append(lines, " "+stDim.Render("No guide for this one. Its summary above is the definition of done."))
+	}
+	body := lipgloss.NewStyle().Width(width - 3).Foreground(lipgloss.Color("252"))
+	for _, raw := range strings.Split(strings.TrimSpace(c.Details), "\n") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
 			continue
 		}
-		nodes := m.nodesFor(sk.ID)
-		rows := flattenTree(nodes, rpg.NodeStatuses(toTreeNodes(nodes), rpg.ProgressFor(sk.TotalXP).Level))
-		name := lipgloss.NewStyle().Foreground(categoryColor(sk.Category)).Bold(true).Width(nameW).
-			Render(truncRunes(sk.Name, nameW-1))
-		lines = append(lines, ansi.Truncate(" "+name+skillNext(sk, rows), width, "…"))
-		shown++
-	}
-	if shown == 0 {
-		lines = append(lines, " "+stDim.Render("Activate a skill to see its next move."))
+		// Markdown bullets become dots; wrapped lines hang under the text.
+		bullet := "  "
+		if rest, ok := cutBullet(raw); ok {
+			bullet, raw = stActive.Render("• "), rest
+		}
+		for i, l := range strings.Split(body.Render(stripMarkdown(raw)), "\n") {
+			if i == 0 {
+				lines = append(lines, " "+bullet+l)
+			} else {
+				lines = append(lines, "   "+l)
+			}
+		}
 	}
 	return lines
+}
+
+// cutBullet strips a markdown list marker ("- ", "* ", "1. ") from a line.
+func cutBullet(line string) (string, bool) {
+	for _, p := range []string{"- ", "* ", "• "} {
+		if rest, ok := strings.CutPrefix(line, p); ok {
+			return rest, true
+		}
+	}
+	if i := strings.Index(line, ". "); i > 0 && i <= 2 {
+		if _, err := fmt.Sscanf(line[:i], "%d", new(int)); err == nil {
+			return line[i+2:], true
+		}
+	}
+	return line, false
+}
+
+// stripMarkdown drops the bold and code markers a guide may use, which a
+// terminal shows as stray characters.
+func stripMarkdown(s string) string {
+	return strings.NewReplacer("**", "", "__", "", "`", "").Replace(s)
 }
 
 // nodeRusty reports whether the named node of the named skill is rusty.

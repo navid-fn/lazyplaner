@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/navid-fn/lazyplaner/internal/db"
+	"github.com/navid-fn/lazyplaner/internal/game"
 	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
 
@@ -74,8 +76,32 @@ func (m model) handleRoadKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.treeSkill = m.charCursor
 			m.openTree()
 		}
+	case "f":
+		if n > 0 && !m.isLoading {
+			sk := m.skills[m.charCursor]
+			m.errorText, m.statusText = "", ""
+			return m, toggleStanceCmd(m.store, sk.ID, sk.Name, !sk.IsActive)
+		}
 	}
 	return m, nil
+}
+
+// stanceMsg says a skill's stance changed, or why it could not.
+type stanceMsg struct {
+	name   string
+	active bool
+	err    error
+}
+
+// toggleStanceCmd makes a skill active or frozen. At most
+// rpg.MaxActiveSkills can be active, so a swap is two presses: freeze one,
+// then activate the other.
+func toggleStanceCmd(store *db.Store, id int64, name string, active bool) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return stanceMsg{name: name, active: active, err: store.SetSkillActive(ctx, id, active)}
+	}
 }
 
 func (m *model) setRoad(skills []db.Skill, nodes []db.Node, events []db.XPEvent) {
@@ -184,7 +210,7 @@ func (m model) renderAttributes(width int) string {
 func (m model) nodesDone() (done, all int) {
 	for _, sk := range m.skills {
 		nodes := m.nodesFor(sk.ID)
-		statuses := rpg.NodeStatuses(toTreeNodes(nodes), rpg.ProgressFor(sk.TotalXP).Level)
+		statuses := rpg.NodeStatuses(game.TreeNodes(nodes), rpg.ProgressFor(sk.TotalXP).Level)
 		for _, n := range nodes {
 			all++
 			if statuses[n.ID] == rpg.Done {
@@ -254,7 +280,7 @@ func (m model) skillCard(sk db.Skill, width int, selected bool) string {
 	inner := width - 4
 
 	nodes := m.nodesFor(sk.ID)
-	rows := flattenTree(nodes, rpg.NodeStatuses(toTreeNodes(nodes), sp.Level))
+	rows := flattenTree(nodes, rpg.NodeStatuses(game.TreeNodes(nodes), sp.Level))
 	done, open, locked := countStatuses(rows)
 
 	xp := stDim.Render(fmt.Sprintf("%d xp", sk.TotalXP))
@@ -283,6 +309,9 @@ func skillNext(sk db.Skill, rows []treeRow) string {
 	if len(rows) == 0 {
 		return stDim.Render("No tree yet")
 	}
+	if game.Eras(db.SkillTree{Skill: sk, Nodes: nodesOf(rows)}).CanExpand {
+		return stSuccess.Render("★ Era complete") + stDim.Render(" · press x in its tree to expand")
+	}
 	if allDone(rows) {
 		return stSuccess.Render("★ Mastered")
 	}
@@ -295,8 +324,7 @@ func skillNext(sk db.Skill, rows []treeRow) string {
 	status := statusByID(rows)
 	best := -1
 	for i, r := range rows {
-		parentDone := r.node.ParentID == 0 || status[r.node.ParentID] == rpg.Done
-		if r.status == rpg.Locked && parentDone &&
+		if r.status == rpg.Locked && parentsDone(r.node, status) &&
 			(best < 0 || r.node.RequiredLevel < rows[best].node.RequiredLevel) {
 			best = i
 		}
@@ -449,6 +477,10 @@ func roadEntry(ev db.XPEvent, width int) string {
 	clock := " " + stDim.Render(ev.CreatedAt.Local().Format("15:04")) + " "
 
 	room := max(width-lipgloss.Width(left)-lipgloss.Width(clock), 4)
+	if ev.Note != "" {
+		// The proof the person wrote is the record of what they did.
+		activity += " · " + ev.Note
+	}
 	text := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(truncRunes(activity, room))
 	gap := max(room-lipgloss.Width(text), 0)
 	return left + text + strings.Repeat(" ", gap) + clock

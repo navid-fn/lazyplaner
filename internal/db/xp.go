@@ -35,6 +35,7 @@ type XPEvent struct {
 	Minutes    int
 	XP         int
 	CreatedAt  time.Time
+	Note       string // what the person wrote they did, for a finished directive
 	// Comeback is true when the award was on a rusty node, so XP includes
 	// the comeback bonus. It is reported, not stored.
 	Comeback bool
@@ -54,6 +55,7 @@ type XPAward struct {
 	Difficulty int
 	Minutes    int
 	XP         int
+	Note       string // proof of the work, if the person wrote one
 
 	NodeID       int64
 	NodeName     string
@@ -129,9 +131,9 @@ func recordXPTx(ctx context.Context, tx *sql.Tx, a XPAward) (XPEvent, error) {
 	}
 
 	result, err := tx.ExecContext(ctx,
-		`INSERT INTO xp_events (skill_id, node_id, plan_id, activity, difficulty, minutes, xp, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		skill.ID, nodeID, a.PlanID, a.Activity, a.Difficulty, a.Minutes, xp, createdAt,
+		`INSERT INTO xp_events (skill_id, node_id, plan_id, activity, difficulty, minutes, xp, created_at, note)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		skill.ID, nodeID, a.PlanID, a.Activity, a.Difficulty, a.Minutes, xp, createdAt, strings.TrimSpace(a.Note),
 	)
 	if err != nil {
 		return XPEvent{}, fmt.Errorf("insert xp event: %w", err)
@@ -152,6 +154,7 @@ func recordXPTx(ctx context.Context, tx *sql.Tx, a XPAward) (XPEvent, error) {
 		Minutes:    a.Minutes,
 		XP:         xp,
 		CreatedAt:  createdAt,
+		Note:       strings.TrimSpace(a.Note),
 		Comeback:   comeback,
 	}, nil
 }
@@ -171,9 +174,14 @@ func findOrCreateSkill(ctx context.Context, tx *sql.Tx, name, category string) (
 		return Skill{}, fmt.Errorf("find skill: %w", err)
 	}
 
+	// A skill made from an award joins the fronts only while there is room.
+	active, err := activeSkillsTx(ctx, tx)
+	if err != nil {
+		return Skill{}, err
+	}
 	result, err := tx.ExecContext(ctx,
-		`INSERT INTO skills (name, category, total_xp) VALUES (?, ?, 0)`,
-		name, category,
+		`INSERT INTO skills (name, category, total_xp, is_active) VALUES (?, ?, 0, ?)`,
+		name, category, boolInt(active < rpg.MaxActiveSkills),
 	)
 	if err != nil {
 		return Skill{}, fmt.Errorf("insert skill: %w", err)
@@ -232,10 +240,11 @@ func resolveNode(ctx context.Context, tx *sql.Tx, skillID int64, a XPAward) (int
 		xpNeeded = required * 40
 	}
 
+	// A node made from an award joins the skill's latest era.
 	result, err := tx.ExecContext(ctx,
-		`INSERT INTO skill_nodes (skill_id, parent_id, name, required_level, xp_needed)
-		 VALUES (?, ?, ?, ?, ?)`,
-		skillID, parentID, name, required, xpNeeded,
+		`INSERT INTO skill_nodes (skill_id, parent_id, name, required_level, xp_needed, era)
+		 VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(era), 1) FROM skill_nodes WHERE skill_id = ?))`,
+		skillID, parentID, name, required, xpNeeded, skillID,
 	)
 	if err != nil {
 		return 0, "", fmt.Errorf("insert node: %w", err)
@@ -278,7 +287,7 @@ func (s *Store) ListSkills(ctx context.Context) ([]Skill, error) {
 func (s *Store) ListXPEvents(ctx context.Context, limit int) ([]XPEvent, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT e.id, s.name, s.category, COALESCE(n.name, ''), e.plan_id, e.activity,
-		        e.difficulty, e.minutes, e.xp, e.created_at
+		        e.difficulty, e.minutes, e.xp, e.created_at, e.note
 		 FROM xp_events e
 		 JOIN skills s ON s.id = e.skill_id
 		 LEFT JOIN skill_nodes n ON n.id = e.node_id
@@ -294,7 +303,7 @@ func (s *Store) ListXPEvents(ctx context.Context, limit int) ([]XPEvent, error) 
 	for rows.Next() {
 		var ev XPEvent
 		if err := rows.Scan(&ev.ID, &ev.SkillName, &ev.Category, &ev.NodeName, &ev.PlanID,
-			&ev.Activity, &ev.Difficulty, &ev.Minutes, &ev.XP, &ev.CreatedAt); err != nil {
+			&ev.Activity, &ev.Difficulty, &ev.Minutes, &ev.XP, &ev.CreatedAt, &ev.Note); err != nil {
 			return nil, fmt.Errorf("scan xp event: %w", err)
 		}
 		events = append(events, ev)

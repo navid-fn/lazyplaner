@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/navid-fn/lazyplaner/internal/db"
 	"github.com/navid-fn/lazyplaner/internal/rpg"
@@ -178,8 +180,9 @@ func TestTreeScreenFitsANarrowTerminal(t *testing.T) {
 	m.skills = []db.Skill{{ID: 1, Name: "Python", Category: "Craft"}}
 	m.nodes = sampleTree()
 	m.openTree()
-	for range 7 {
-		m = send(t, m, key("j"))
+	// Down to Functions, then along its column to Patterns.
+	for _, k := range []string{"l", "l", "l", "j", "j", "j"} {
+		m = send(t, m, key(k))
 	}
 	view := m.View()
 	lines := strings.Split(view, "\n")
@@ -233,6 +236,12 @@ func TestTreeEnterCompletesTheNodesDirective(t *testing.T) {
 	if view := m.View(); !strings.Contains(view, "Write a REPL session log") || !strings.Contains(view, "complete") {
 		t.Error("the inspector should show the node's directive and how to complete it")
 	}
+	m.challenges[1].StartedAt = time.Now().Add(-20 * time.Minute)
+	m = send(t, m, key("enter"))
+	if m.proof == nil || m.proof.challenge.ID != 8 {
+		t.Fatal("enter on the node's started directive should ask for proof")
+	}
+	m = typeText(t, m, "logged a session")
 	m = send(t, m, key("enter"))
 	if !m.isLoading || !strings.Contains(m.loadingText, "Write a REPL session log") {
 		t.Errorf("enter should complete the selected node's directive, loading=%v text=%q", m.isLoading, m.loadingText)
@@ -300,18 +309,38 @@ func TestLongStatusDoesNotPushTheScreenUp(t *testing.T) {
 	}
 }
 
-// diamondNodes is the 8-node tree BuildRoadmap shapes, for a skill at start.
+// diamondNodes is the 8-node tree BuildRoadmap shapes, for a skill at start:
+// node IDs are index+1, N5 joins N2 and N3, N6 joins N3 and N4, and the
+// capstone N7 joins N5 and N6.
 func diamondNodes(start int) []db.Node {
 	parents := []int64{0, 0, 1, 1, 2, 4, 5, 6}
+	joins := map[int]int64{5: 3, 6: 4, 7: 7}
 	levels := map[int][]int{1: {1, 1, 2, 2, 2, 4, 4, 6}, 2: {1, 1, 1, 2, 2, 3, 3, 5}}[start]
 	var out []db.Node
 	for i := range 8 {
 		cost := rpg.NodeXPNeeded(levels[i])
-		out = append(out, db.Node{ID: int64(i + 1), SkillID: 1, ParentID: parents[i],
-			Name: fmt.Sprintf("N%d", i), RequiredLevel: levels[i], XPNeeded: cost,
+		out = append(out, db.Node{ID: int64(i + 1), SkillID: 1, ParentID: parents[i], ExtraParentID: joins[i],
+			Era: 1, IsCapstone: i == 7, Name: fmt.Sprintf("N%d", i), RequiredLevel: levels[i], XPNeeded: cost,
 			Progress: rpg.StartProgress(levels[i], start, cost)})
 	}
 	return out
+}
+
+// twoEras is diamondNodes(1) with every node done, followed by a second era
+// that grows from its capstone.
+func twoEras() []db.Node {
+	nodes := diamondNodes(1)
+	for i := range nodes {
+		nodes[i].Progress = nodes[i].XPNeeded
+	}
+	parents := []int64{8, 8, 9, 9, 10, 12, 13, 14}
+	joins := map[int]int64{5: 11, 6: 12, 7: 15}
+	for i := range 8 {
+		lv := 7 + []int{0, 0, 1, 1, 1, 3, 3, 5}[i]
+		nodes = append(nodes, db.Node{ID: int64(i + 9), SkillID: 1, ParentID: parents[i], ExtraParentID: joins[i],
+			Era: 2, IsCapstone: i == 7, Name: fmt.Sprintf("E%d", i), RequiredLevel: lv, XPNeeded: rpg.NodeXPNeeded(lv)})
+	}
+	return nodes
 }
 
 func TestLeafNodesExplainThemselves(t *testing.T) {
@@ -326,9 +355,13 @@ func TestLeafNodesExplainThemselves(t *testing.T) {
 		m.treeNode = i
 		view := m.View()
 		switch r.node.Name {
-		case "N2": // column 2's top node: no children
-			if !strings.Contains(view, "side branch") || !strings.Contains(view, "counts toward Lv 4") {
-				t.Errorf("N2 should be explained as a side branch toward Lv 4")
+		case "N2": // column 2's top node joins into N5: no longer a dead end
+			if strings.Contains(view, "side branch") || !strings.Contains(view, "leads to") {
+				t.Errorf("N2 should lead on to N5, not be a side branch")
+			}
+		case "N5": // two parents
+			if !strings.Contains(view, "N3") || !strings.Contains(view, "N2") {
+				t.Errorf("N5 should name both of its parents")
 			}
 		case "N7":
 			if strings.Contains(view, "capstone") {
@@ -384,11 +417,23 @@ func TestGAsksForADirectiveOnAnOpenNode(t *testing.T) {
 		t.Error("g should not be offered on a locked node")
 	}
 
+	// An open focus directive is rerolled by g instead of piling up another.
 	m.treeNode = 0
 	m.challenges = []db.Challenge{{ID: 1, Tier: rpg.TierFocus, SkillName: "Cook", NodeName: "N0", Title: "Dice an onion"}}
+	if !strings.Contains(m.View(), "reroll") {
+		t.Error("an open focus directive should offer g to reroll it")
+	}
 	m = send(t, m, key("g"))
-	if m.dailyBusy != "" || !strings.Contains(m.statusText, "already has a directive") {
-		t.Errorf("g on a node with a directive: busy=%q status=%q", m.dailyBusy, m.statusText)
+	if !strings.Contains(m.dailyBusy, "Drafting a directive for N0") {
+		t.Errorf("g on an open focus directive should reroll it: busy=%q status=%q", m.dailyBusy, m.statusText)
+	}
+
+	// A directive of the day's set, or a finished one, is refused.
+	m.dailyBusy = ""
+	m.challenges = []db.Challenge{{ID: 1, Tier: rpg.TierCoreOp, SkillName: "Cook", NodeName: "N0", Title: "Dice an onion"}}
+	m = send(t, m, key("g"))
+	if m.dailyBusy != "" || !strings.Contains(m.statusText, "part of the set or done") {
+		t.Errorf("g on a node with a set directive: busy=%q status=%q", m.dailyBusy, m.statusText)
 	}
 }
 
@@ -406,5 +451,116 @@ func TestFocusDirectivesAreNotTheDailySet(t *testing.T) {
 	m = send(t, m, key("g"))
 	if m.dailyBusy != "Generating…" {
 		t.Errorf("g should generate the set, busy=%q", m.dailyBusy)
+	}
+}
+
+func TestMoveInTreeWalksTheMap(t *testing.T) {
+	rows := flattenTree(sampleTree(), nil)
+	at := func(name string) int {
+		for i, r := range rows {
+			if r.node.Name == name {
+				return i
+			}
+		}
+		t.Fatalf("no row %q", name)
+		return -1
+	}
+	cases := []struct{ from, key, want string }{
+		{"Basics", "l", "Variables"},
+		{"Variables", "h", "Basics"},
+		{"Basics", "h", "Basics"},     // the top level has no parent card
+		{"Variables", "j", "Tooling"}, // same column, next card down
+		{"Tooling", "k", "Variables"},
+		{"Tooling", "l", "Tooling"},   // a leaf has no children
+		{"Functions", "j", "Modules"}, // siblings
+		{"Modules", "j", "OOP"},       // crosses to a cousin in the same column
+		{"Patterns", "j", "Patterns"}, // bottom of the column
+		{"Control", "down", "Loops"},
+	}
+	for _, c := range cases {
+		if got := rows[moveInTree(rows, at(c.from), c.key)].node.Name; got != c.want {
+			t.Errorf("%s from %s = %s, want %s", c.key, c.from, got, c.want)
+		}
+	}
+}
+
+func TestTreeScreenShowsErasAndJumpsBetweenThem(t *testing.T) {
+	m := newFlowModel(t)
+	m.width, m.height = 200, 50
+	m.skills = []db.Skill{{ID: 1, Name: "Java", Category: "Craft", TotalXP: rpg.TotalXPForLevel(7)}}
+	m.nodes = twoEras()
+	m.eras = []db.Era{{SkillID: 1, Era: 2, Title: "Spring at Scale"}}
+	m.openTree()
+
+	view := m.View()
+	for _, want := range []string{"Era II", "8/16 done", "Spring at Scale"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("tree screen should show %q", want)
+		}
+	}
+	for i, line := range strings.Split(view, "\n") {
+		if w := lipgloss.Width(line); w > m.width {
+			t.Errorf("line %d is %d wide, wider than the %d-column terminal", i, w, m.width)
+		}
+	}
+
+	// ] jumps to the first node of era II, [ back to era I.
+	next, _ := m.handleTreeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	m = next.(model)
+	if r := m.treeRows()[m.treeNode]; r.node.Name != "E0" {
+		t.Errorf("] landed on %s, want E0", r.node.Name)
+	}
+	if !strings.Contains(m.View(), "from N7") {
+		t.Error("an era's foundation should show it grows from the last capstone")
+	}
+	next, _ = m.handleTreeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[")})
+	m = next.(model)
+	if r := m.treeRows()[m.treeNode]; r.node.Era != 1 {
+		t.Errorf("[ landed in era %d, want 1", r.node.Era)
+	}
+}
+
+func TestXExpandsOnlyAFinishedEra(t *testing.T) {
+	m := newFlowModel(t)
+	m.width, m.height = 200, 50
+	m.skills = []db.Skill{{ID: 1, Name: "Java", Category: "Craft"}}
+	m.nodes = diamondNodes(1)
+	m.openTree()
+
+	next, cmd := m.handleTreeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = next.(model)
+	if cmd != nil || !strings.Contains(m.statusText, "Finish Era I") {
+		t.Errorf("x on an open era: status %q", m.statusText)
+	}
+
+	for i := range m.nodes {
+		m.nodes[i].Progress = m.nodes[i].XPNeeded
+	}
+	m.skills[0].TotalXP = rpg.TotalXPForLevel(6)
+	if !strings.Contains(m.View(), "expand into Era II") {
+		t.Error("a finished era should offer x")
+	}
+	next, cmd = m.handleTreeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = next.(model)
+	if cmd == nil || !strings.Contains(m.dailyBusy, "Era II") {
+		t.Errorf("x on a finished era should start designing era II, busy %q", m.dailyBusy)
+	}
+}
+
+func TestJoinLinesReachEveryCard(t *testing.T) {
+	nodes := diamondNodes(1)
+	if got := len(joinEdges(nodes)); got != 3 {
+		t.Fatalf("got %d join lines, want 3", got)
+	}
+	// Every node but the capstone leads somewhere, so none is a dead end.
+	leads := map[int64]bool{}
+	for _, n := range nodes {
+		leads[n.ParentID] = true
+		leads[n.ExtraParentID] = true
+	}
+	for _, n := range nodes {
+		if !n.IsCapstone && !leads[n.ID] {
+			t.Errorf("%s leads nowhere", n.Name)
+		}
 	}
 }

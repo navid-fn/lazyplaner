@@ -54,17 +54,20 @@ func StartProgress(required, startLevel, xpNeeded int) int {
 type TreeNode struct {
 	ID       int64
 	ParentID int64 // 0 means the node hangs directly off the skill
-	Required int
-	Progress int
-	XPNeeded int
-	Rusty    bool // marked rusty and not practised since
+	// ExtraParentID is a second parent, 0 for none. A node with two
+	// parents waits for both.
+	ExtraParentID int64
+	Required      int
+	Progress      int
+	XPNeeded      int
+	Rusty         bool // marked rusty and not practised since
 }
 
 // NodeStatuses works out the status of every node for a skill at skillLevel.
 //
-// A node is Locked when the skill level is below its requirement or, for a
-// node with a parent, when that parent is not Done yet: a branch opens one
-// node at a time, so a child waits for its parent to be finished. Otherwise it is Done when its progress reached its cost,
+// A node is Locked when the skill level is below its requirement or when
+// one of its parents is not Done yet: a branch opens one node at a time, so
+// a child waits for its parents to be finished. Otherwise it is Done when its progress reached its cost,
 // Rusty when it has been marked rusty, and Unlocked if neither. nodes must
 // be ordered so that a parent comes before its children, which is the order
 // rows are inserted in.
@@ -76,53 +79,52 @@ type TreeNode struct {
 // finish every open node before it reaches the next level.
 func NodeStatuses(nodes []TreeNode, skillLevel int) map[int64]Status {
 	statuses := strictStatuses(nodes, skillLevel)
-	for _, s := range statuses {
-		if s == Unlocked || s == Rusty {
-			return statuses
+	// Each pass turns at least one locked node, so this ends. A tier that
+	// comes out all done (its XP was already in) lets the next one open, so
+	// a finished capstone opens the era that grows from it.
+	for {
+		for _, s := range statuses {
+			if s == Unlocked || s == Rusty {
+				return statuses
+			}
 		}
-	}
-
-	next := 0
-	for _, n := range nodes {
-		if statuses[n.ID] == Locked && parentDone(n, statuses) && (next == 0 || n.Required < next) {
-			next = n.Required
+		next := 0
+		for _, n := range nodes {
+			if statuses[n.ID] == Locked && parentDone(n, statuses) && (next == 0 || n.Required < next) {
+				next = n.Required
+			}
 		}
-	}
-	if next == 0 {
-		return statuses // everything is done, or nothing can open
-	}
-	for _, n := range nodes {
-		if statuses[n.ID] == Locked && parentDone(n, statuses) && n.Required == next {
-			switch {
-			case n.Progress >= n.XPNeeded:
-				statuses[n.ID] = Done
-			case n.Rusty:
-				statuses[n.ID] = Rusty
-			default:
-				statuses[n.ID] = Unlocked
+		if next == 0 {
+			return statuses // everything is done, or nothing can open
+		}
+		for _, n := range nodes {
+			if statuses[n.ID] == Locked && parentDone(n, statuses) && n.Required == next {
+				switch {
+				case n.Progress >= n.XPNeeded:
+					statuses[n.ID] = Done
+				case n.Rusty:
+					statuses[n.ID] = Rusty
+				default:
+					statuses[n.ID] = Unlocked
+				}
 			}
 		}
 	}
-	return statuses
 }
 
-// parentDone reports whether n hangs off the skill or off a done node.
+// parentDone reports whether every parent of n is done. A node that hangs
+// off the skill has none. A missing parent reads as Locked, the zero value.
 func parentDone(n TreeNode, statuses map[int64]Status) bool {
-	return n.ParentID == 0 || statuses[n.ParentID] == Done
+	return (n.ParentID == 0 || statuses[n.ParentID] == Done) &&
+		(n.ExtraParentID == 0 || statuses[n.ExtraParentID] == Done)
 }
 
 // strictStatuses applies the level and parent rules with no exception.
 func strictStatuses(nodes []TreeNode, skillLevel int) map[int64]Status {
 	statuses := make(map[int64]Status, len(nodes))
 	for _, n := range nodes {
-		parentDone := true
-		if n.ParentID != 0 {
-			// A missing parent reads as Locked, the zero value.
-			parentDone = statuses[n.ParentID] == Done
-		}
-
 		switch {
-		case !parentDone, skillLevel < n.Required:
+		case !parentDone(n, statuses), skillLevel < n.Required:
 			statuses[n.ID] = Locked
 		case n.Progress >= n.XPNeeded:
 			statuses[n.ID] = Done
@@ -166,4 +168,48 @@ func RustTarget(nodes []TreeNode, skillLevel int, active bool, lastPracticed, no
 		return 0, false
 	}
 	return FrontierNode(nodes, skillLevel)
+}
+
+// CanExpand reports whether a skill is ready for its next era: the
+// capstone of its latest era is done, or at most one node of that era is
+// left to finish. latest holds the IDs of the latest era's nodes and
+// capstone is its capstone's ID (0 if unknown). A skill with no nodes has
+// no era to grow from.
+func CanExpand(statuses map[int64]Status, latest []int64, capstone int64) bool {
+	if len(latest) == 0 {
+		return false
+	}
+	if capstone != 0 && statuses[capstone] == Done {
+		return true
+	}
+	left := 0
+	for _, id := range latest {
+		if statuses[id] != Done {
+			left++
+		}
+	}
+	return left <= 1
+}
+
+// FogRange is how far above the skill's level a locked node still shows its
+// name. Nodes further out are shrouded in fog until the person levels closer.
+const FogRange = 2
+
+// Shrouded reports whether a node with this status and required level is
+// hidden in fog for a skill at level.
+func Shrouded(st Status, required, level int) bool {
+	return st == Locked && required > level+FogRange
+}
+
+// String is the status as the CLI prints it.
+func (s Status) String() string {
+	switch s {
+	case Done:
+		return "DONE"
+	case Unlocked:
+		return "OPEN"
+	case Rusty:
+		return "RUSTY"
+	}
+	return "LOCKED"
 }

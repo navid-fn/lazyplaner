@@ -11,6 +11,13 @@ import (
 // of bg, so the screen behind a popup stays visible. Both strings may contain
 // ANSI styling; width and height are the size of the area being covered.
 func overlay(bg, fg string, width, height int) string {
+	return overlayIn(bg, fg, width, height, height)
+}
+
+// overlayIn is overlay with fg centered vertically in a taller area of
+// centerH lines that starts at the top of bg, such as the whole terminal
+// with the footer under bg. fg is kept inside bg.
+func overlayIn(bg, fg string, width, height, centerH int) string {
 	bgLines := strings.Split(bg, "\n")
 	for len(bgLines) < height {
 		bgLines = append(bgLines, "")
@@ -22,7 +29,7 @@ func overlay(bg, fg string, width, height int) string {
 	}
 	fgH := len(fgLines)
 	x := max((width-fgW)/2, 0)
-	y := max((height-fgH)/2, 0)
+	y := clamp((centerH-fgH)/2, 0, max(height-fgH, 0))
 
 	for i, fl := range fgLines {
 		row := y + i

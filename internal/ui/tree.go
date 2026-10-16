@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/navid-fn/lazyplaner/internal/db"
+	"github.com/navid-fn/lazyplaner/internal/game"
 	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
 
@@ -28,14 +30,14 @@ const (
 
 // fogRange is how far above the skill's level a locked node still shows its
 // name. Nodes further out are hidden in fog until the person levels closer.
-const fogRange = 2
+const fogRange = rpg.FogRange
 
 // fogLabel stands in for a node hidden in fog.
 const fogLabel = "░░ [ ??? ]"
 
 // fogged reports whether a node is hidden in fog for a skill at level.
 func fogged(n db.Node, st rpg.Status, level int) bool {
-	return st == rpg.Locked && n.RequiredLevel > level+fogRange
+	return rpg.Shrouded(st, n.RequiredLevel, level)
 }
 
 // nodeName is a node's name, or ??? while it is in fog.
@@ -132,31 +134,38 @@ func (m *model) openTree() {
 
 func (m model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	n := len(m.skills)
-	rows := len(m.treeRows())
+	rows := m.treeRows()
 	switch msg.String() {
 	case "esc", "t":
 		m.screen = m.treeReturn
 	case "q":
 		return m, tea.Quit
-	// Arrows and vim keys do the same moves: h/l and j/k.
-	case "left", "h":
-		if n > 0 {
-			m.treeSkill = (m.treeSkill - 1 + n) % n
-			m.treeNode = 0
-		}
-	case "right", "l", "tab":
+	// tab and shift+tab switch skill; hjkl and the arrows walk the map.
+	case "tab":
 		if n > 0 {
 			m.treeSkill = (m.treeSkill + 1) % n
 			m.treeNode = 0
 		}
-	case "up", "k":
-		if rows > 0 {
-			m.treeNode = max(m.treeNode-1, 0)
+	case "shift+tab":
+		if n > 0 {
+			m.treeSkill = (m.treeSkill - 1 + n) % n
+			m.treeNode = 0
 		}
-	case "down", "j":
-		if rows > 0 {
-			m.treeNode = min(m.treeNode+1, rows-1)
+	case "left", "h", "right", "l", "up", "k", "down", "j":
+		if len(rows) > 0 {
+			m.treeNode = moveInTree(rows, clamp(m.treeNode, 0, len(rows)-1), msg.String())
 		}
+	case "[", "]":
+		if len(rows) > 0 {
+			dir := 1
+			if msg.String() == "[" {
+				dir = -1
+			}
+			m.treeNode = jumpEra(rows, clamp(m.treeNode, 0, len(rows)-1), dir)
+		}
+	case "x":
+		cmd := m.expandEra()
+		return m, cmd
 	case "enter", " ":
 		if m.isLoading {
 			return m, nil
@@ -169,7 +178,7 @@ func (m model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		cmd := m.openSkillEdit()
 		return m, cmd
 	case "?":
-		// h moves left on this screen, so help is on ? here.
+		// h moves on this screen, so help is on ? here.
 		m.openHelp()
 	}
 	return m, nil
@@ -213,8 +222,9 @@ func (m model) completeNodeDirective() (tea.Model, tea.Cmd) {
 	return m.completeChallenge(c)
 }
 
-// canAskDirective reports whether the selected node can get a new directive
-// with g: it is open or rusty and has none today.
+// canAskDirective reports whether the selected node can get a directive
+// with g: it is open or rusty and has none today, or only an open focus
+// directive, which g rerolls (a skill keeps one open focus directive).
 func (m model) canAskDirective() bool {
 	rows := m.treeRows()
 	if len(rows) == 0 {
@@ -224,8 +234,8 @@ func (m model) canAskDirective() bool {
 	if r.status != rpg.Unlocked && r.status != rpg.Rusty {
 		return false
 	}
-	_, has := m.nodeDirective(m.skills[m.treeSkill].Name, r.node.Name)
-	return !has
+	c, has := m.nodeDirective(m.skills[m.treeSkill].Name, r.node.Name)
+	return !has || (!c.Done && c.Tier == rpg.TierFocus)
 }
 
 // newNodeDirective asks the model for a focus directive for the selected
@@ -249,23 +259,151 @@ func (m *model) newNodeDirective() tea.Cmd {
 		m.statusText = "This node is locked. Pick an open one."
 		return nil
 	case !m.canAskDirective():
-		m.statusText = "This node already has a directive today."
+		m.statusText = "This node's directive today is part of the set or done; work on that one."
 		return nil
 	}
 	return m.runDailyJob(dailyNode, db.Challenge{SkillName: skill.Name, NodeName: r.node.Name},
 		"Drafting a directive for "+r.node.Name+"…")
 }
 
+// treeEra is the era state of the selected skill's tree.
+func (m model) treeEra() game.EraState {
+	if len(m.skills) == 0 {
+		return game.EraState{}
+	}
+	skill := m.skills[clamp(m.treeSkill, 0, len(m.skills)-1)]
+	return game.Eras(db.SkillTree{Skill: skill, Nodes: m.nodesFor(skill.ID)})
+}
+
+// expandEra asks the model for the next era of the selected skill, once
+// its latest era is (nearly) finished. Agents do the same through the CLI's
+// expand-tree with nodes they design themselves.
+func (m *model) expandEra() tea.Cmd {
+	if m.dailyBusy != "" || len(m.skills) == 0 {
+		return nil
+	}
+	m.errorText, m.statusText = "", ""
+	era := m.treeEra()
+	switch {
+	case era.Latest == 0:
+		m.statusText = "This skill has no tree to expand yet."
+		return nil
+	case !era.CanExpand:
+		m.statusText = fmt.Sprintf("Finish Era %s first: its capstone, or all but one of its nodes.", game.RomanEra(era.Latest))
+		return nil
+	}
+	skill := m.skills[m.treeSkill].Name
+	m.dailyBusy = fmt.Sprintf("Designing Era %s of %s…", game.RomanEra(era.Latest+1), skill)
+	return tea.Batch(m.spinner.Tick, expandEraCmd(m.client, m.store, skill))
+}
+
+// jumpEra moves the cursor to the first card of the next era (dir 1) or
+// the one before (dir -1), and stays put when there is none.
+func jumpEra(rows []treeRow, cur, dir int) int {
+	target := max(rows[cur].node.Era, 1) + dir
+	best := -1
+	for i, r := range rows {
+		if max(r.node.Era, 1) == target && (best < 0 || r.node.ID < rows[best].node.ID) {
+			best = i // the era's first node, a foundation
+		}
+	}
+	if best < 0 {
+		return cur
+	}
+	return best
+}
+
+// currentEra is the era the person is working in: the first with a node
+// left to finish, or the latest when all are done. done and total count the
+// nodes of that era and every era before it.
+func currentEra(rows []treeRow) (era, done, total int) {
+	latest := 0
+	for _, r := range rows {
+		latest = max(latest, max(r.node.Era, 1))
+		if r.status != rpg.Done && (era == 0 || max(r.node.Era, 1) < era) {
+			era = max(r.node.Era, 1)
+		}
+	}
+	if era == 0 {
+		era = latest
+	}
+	for _, r := range rows {
+		if max(r.node.Era, 1) <= era {
+			total++
+			if r.status == rpg.Done {
+				done++
+			}
+		}
+	}
+	return era, done, total
+}
+
+// eraTitle is the saved title of one era of a skill, or "".
+func (m model) eraTitle(skillID int64, era int) string {
+	for _, e := range m.eras {
+		if e.SkillID == skillID && e.Era == era {
+			return e.Title
+		}
+	}
+	return ""
+}
+
 // treeRows returns the nodes of the selected skill in depth-first order,
-// which is the order j and k move through them.
+// which is top to bottom on the map.
 func (m model) treeRows() []treeRow {
 	if len(m.skills) == 0 {
 		return nil
 	}
 	skill := m.skills[m.treeSkill]
 	nodes := m.nodesFor(skill.ID)
-	statuses := rpg.NodeStatuses(toTreeNodes(nodes), rpg.ProgressFor(skill.TotalXP).Level)
+	statuses := rpg.NodeStatuses(game.TreeNodes(nodes), rpg.ProgressFor(skill.TotalXP).Level)
 	return flattenTree(nodes, statuses)
+}
+
+// moveInTree returns the row the cursor lands on after a move on the map,
+// which grows left to right: h goes to the parent, l to the first child,
+// and j/k to the next card below or above in the same column. A move with
+// nowhere to go stays put.
+func moveInTree(rows []treeRow, cur int, key string) int {
+	index := map[int64]int{}
+	for i, r := range rows {
+		index[r.node.ID] = i
+	}
+	depth := func(i int) int {
+		d := 0
+		for p := rows[i].node.ParentID; p != 0; d++ {
+			j, ok := index[p]
+			if !ok {
+				break
+			}
+			p = rows[j].node.ParentID
+		}
+		return d
+	}
+	switch key {
+	case "left", "h":
+		if i, ok := index[rows[cur].node.ParentID]; ok {
+			return i
+		}
+	case "right", "l":
+		// Depth-first order puts a node's first child right after it.
+		if cur+1 < len(rows) && rows[cur+1].node.ParentID == rows[cur].node.ID {
+			return cur + 1
+		}
+	case "down", "j":
+		for i, d := cur+1, depth(cur); i < len(rows); i++ {
+			if depth(i) == d {
+				return i
+			}
+		}
+	case "up", "k":
+		for i, d := cur-1, depth(cur); i >= 0; i-- {
+			if depth(i) == d {
+				return i
+			}
+		}
+	}
+	return cur
 }
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
@@ -331,6 +469,14 @@ func (m model) treeHero(skill db.Skill, rows []treeRow, width int) string {
 		chipLabel(skill.Category, lipgloss.Color(cat)) + " " +
 		chipLabel(fmt.Sprintf("LV %d", p.Level), colorActive) + " " +
 		stDim.Render(rpg.RankTitle(p.Level))
+	if len(rows) > 0 {
+		era, eraDone, eraTotal := currentEra(rows)
+		title += "  " + chipLabel("Era "+game.RomanEra(era), colorSuccess) +
+			stDim.Render(fmt.Sprintf(" · %d/%d done", eraDone, eraTotal))
+		if name := m.eraTitle(skill.ID, era); name != "" {
+			title += stDim.Render(" · ") + stActive.Render(name)
+		}
+	}
 	stats := stSuccess.Render(fmt.Sprintf("✓ %d done", done)) + "   " +
 		stActive.Render(fmt.Sprintf("◆ %d open", open)) + "   " +
 		lipgloss.NewStyle().Foreground(lipgloss.Color(inkLocked)).Render(fmt.Sprintf("◇ %d locked", locked)) + " "
@@ -340,7 +486,13 @@ func (m model) treeHero(skill db.Skill, rows []treeRow, width int) string {
 		stActive.Render(fmt.Sprintf("%d", p.Into)) +
 		stDim.Render(fmt.Sprintf(" / %d xp to Lv %d", p.Span, p.Level+1))
 
-	return spread(title, stats, width) + "\n" + xpLine + "\n" + " " + nextGoal(skill, rows)
+	goal := nextGoal(skill, rows)
+	if era := m.treeEra(); era.CanExpand {
+		goal = stSuccess.Render(fmt.Sprintf("★ Era %s is complete. ", game.RomanEra(era.Latest))) +
+			keyChip("x", fmt.Sprintf("expand into Era %s", game.RomanEra(era.Latest+1))) +
+			stDim.Render("     ·     ") + goal
+	}
+	return spread(title, stats, width) + "\n" + xpLine + "\n" + " " + goal
 }
 
 // nextGoal says what the person is closest to: the next node their level
@@ -363,8 +515,7 @@ func nextGoal(skill db.Skill, rows []treeRow) string {
 				rusty = i
 			}
 		case rpg.Locked:
-			parentDone := n.ParentID == 0 || status[n.ParentID] == rpg.Done
-			if parentDone && (unlock < 0 || n.RequiredLevel < rows[unlock].node.RequiredLevel) {
+			if parentsDone(n, status) && (unlock < 0 || n.RequiredLevel < rows[unlock].node.RequiredLevel) {
 				unlock = i
 			}
 		case rpg.Unlocked:
@@ -430,19 +581,26 @@ func treeDetail(skill db.Skill, rows []treeRow, cursor, width int) string {
 	if r.status == rpg.Done {
 		frac = 1
 	}
-	parent := skill.Name
-	var leadsTo []string
+	// A node with two parents needs both; the inspector names them all, and
+	// every node that grows from this one.
+	var parents, leadsTo []string
 	for _, other := range rows {
-		if other.node.ID == n.ParentID {
-			parent = other.node.Name
+		if other.node.ID == n.ParentID || (n.ExtraParentID != 0 && other.node.ID == n.ExtraParentID) {
+			parents = append(parents, other.node.Name)
 		}
-		if other.node.ParentID == n.ID {
+		if other.node.ParentID == n.ID || other.node.ExtraParentID == n.ID {
 			leadsTo = append(leadsTo, nodeName(other.node, other.status, level))
 		}
 	}
+	if len(parents) == 0 {
+		parents = []string{skill.Name}
+	}
 	line2 := " " + gradientBar(frac, 24, ink, lighten(ink, 0.5)) +
 		stDim.Render(fmt.Sprintf(" %d/%d xp", n.Progress, n.XPNeeded)) +
-		"     " + stDim.Render("from ") + parent
+		"     " + stDim.Render("from ") + strings.Join(parents, stDim.Render(" + "))
+	if n.IsCapstone {
+		line2 += "     " + stSuccess.Render(fmt.Sprintf("★ Era %s capstone", game.RomanEra(max(n.Era, 1))))
+	}
 	if len(leadsTo) > 0 {
 		line2 += "     " + stDim.Render("leads to ") + strings.Join(leadsTo, stDim.Render(", "))
 	} else {
@@ -477,6 +635,9 @@ func treeDetail(skill db.Skill, rows []treeRow, cursor, width int) string {
 // Any other leaf is a side branch: no node needs it, but its XP still counts
 // toward the level that opens the next column.
 func leafNote(n db.Node, rows []treeRow, level int) string {
+	if n.IsCapstone {
+		return stDim.Render("the next era grows from here · x expands once it is done")
+	}
 	gate := 0
 	for _, r := range rows {
 		req := r.node.RequiredLevel
@@ -504,6 +665,10 @@ func (m model) treeDirectiveLine(skill db.Skill, rows []treeRow, cursor, width i
 		line = " " + m.spinner.View() + " " + stActive.Render(m.dailyBusy)
 	case !ok && m.canAskDirective():
 		line = " " + stDim.Render("🎯 No directive for this node today.   ") + keyChip("g", "new directive")
+	case !c.Done && c.Started():
+		line = " " + lipgloss.NewStyle().Foreground(colorKeyLabel).Bold(true).Render("▶ "+c.Title) +
+			stDim.Render(fmt.Sprintf("  %s in  ", elapsedLabel(time.Since(c.StartedAt)))) +
+			chipLabel(fmt.Sprintf("+%d XP", c.XP), colorSuccess) + "   " + keyChip("enter", "finish")
 	case !ok:
 		line = " " + stDim.Render("🎯 No directive for this node today.")
 	case c.Done:
@@ -511,7 +676,10 @@ func (m model) treeDirectiveLine(skill db.Skill, rows []treeRow, cursor, width i
 	default:
 		line = " " + stActive.Render("🎯 "+c.Title) +
 			stDim.Render(fmt.Sprintf("  ◷ %d min  ", c.Minutes)) + chipLabel(fmt.Sprintf("+%d XP", c.XP), colorSuccess) +
-			"   " + keyChip("enter", "complete")
+			"   " + keyChip("enter", "start")
+		if m.canAskDirective() {
+			line += "  " + keyChip("g", "reroll")
+		}
 	}
 	return ansi.Truncate(line, width, "…")
 }
@@ -539,6 +707,24 @@ func (m model) treeMap(skill db.Skill, rows []treeRow, cursor, viewW, viewH int)
 	cv := newCanvas(mapW, mapH)
 
 	// Lines go first so the cards drawn after them cover the line ends.
+	// Joining lines (a node's second parent, which closes the diamond) go
+	// under the tree's own lines. A joining line turns next to its parent
+	// when the parent's own line already leaves the card, so it reads as a
+	// branch; otherwise it turns next to the child and reads as a merge.
+	joins := joinEdges(nodes)
+	for _, j := range joins {
+		p, okP := pos[j.from]
+		c, okC := pos[j.to]
+		if !okP || !okC {
+			continue
+		}
+		turn := cardGap/2 + 1
+		if len(children[j.from]) > 0 {
+			turn = cardGap/2 - 1
+		}
+		drawEdgeAt(cv, p, c, g.cardW, turn, edgeInk(j.to, status, path, cat))
+	}
+
 	// Within one parent, brighter lines are drawn last so they win where
 	// lines share cells, and the path to the selected node is brightest.
 	for parentID, kids := range children {
@@ -594,6 +780,19 @@ func (m model) treeMap(skill db.Skill, rows []treeRow, cursor, viewW, viewH int)
 		}
 	}
 
+	for _, j := range joins {
+		p, okP := pos[j.from]
+		c, okC := pos[j.to]
+		if !okP || !okC {
+			continue
+		}
+		ink := edgeInk(j.to, status, path, cat)
+		if len(children[j.from]) == 0 {
+			cv.set(p.x+g.cardW-1, p.y+1, joint('├', j.from == selected), ink, false)
+		}
+		cv.set(c.x, c.y+1, joint('┤', j.to == selected), ink, false)
+	}
+
 	focusX, focusY := root.x, root.y
 	if p, ok := pos[selected]; ok {
 		focusX, focusY = p.x+g.cardW/2, p.y
@@ -641,11 +840,18 @@ func treeLayout(nodes []db.Node, g mapGeom) (map[int64]point, int, int) {
 }
 
 // drawEdge draws a line from a parent card's right side to a child card's
-// left side, turning down or up in the gap between them.
+// left side, turning down or up in the middle of the gap between them.
 func drawEdge(cv *canvas, parent, child point, parentW int, ink string) {
+	drawEdgeAt(cv, parent, child, parentW, cardGap/2, ink)
+}
+
+// drawEdgeAt is drawEdge with the line turning turn cells after the
+// parent's right side, so a second line through the same gap can turn in
+// its own column instead of crossing the first.
+func drawEdgeAt(cv *canvas, parent, child point, parentW, turn int, ink string) {
 	pm, cm := parent.y+1, child.y+1 // middle rows of the two cards
 	start := parent.x + parentW
-	jx := start + cardGap/2
+	jx := start + clamp(turn, 0, max(child.x-start-1, 0))
 
 	for x := start; x < jx; x++ {
 		cv.link(x, pm, dirLeft|dirRight, ink)
@@ -903,6 +1109,36 @@ func truncRunes(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
+// joinEdge is a line from a node's second parent to the node.
+type joinEdge struct{ from, to int64 }
+
+// joinEdges lists the second-parent lines of a tree, in insertion order.
+func joinEdges(nodes []db.Node) []joinEdge {
+	var out []joinEdge
+	for _, n := range nodes {
+		if n.ExtraParentID != 0 {
+			out = append(out, joinEdge{from: n.ExtraParentID, to: n.ID})
+		}
+	}
+	return out
+}
+
+// parentsDone reports whether every parent of n is done, so a locked n
+// waits only on level.
+func parentsDone(n db.Node, status map[int64]rpg.Status) bool {
+	return (n.ParentID == 0 || status[n.ParentID] == rpg.Done) &&
+		(n.ExtraParentID == 0 || status[n.ExtraParentID] == rpg.Done)
+}
+
+// nodesOf returns the nodes of rows.
+func nodesOf(rows []treeRow) []db.Node {
+	out := make([]db.Node, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.node)
+	}
+	return out
+}
+
 // childrenOf groups nodes by parent, keeping insertion order.
 func childrenOf(nodes []db.Node) map[int64][]db.Node {
 	children := map[int64][]db.Node{}
@@ -923,22 +1159,7 @@ func (m model) nodesFor(skillID int64) []db.Node {
 	return out
 }
 
-func toTreeNodes(nodes []db.Node) []rpg.TreeNode {
-	out := make([]rpg.TreeNode, 0, len(nodes))
-	for _, n := range nodes {
-		out = append(out, rpg.TreeNode{
-			ID:       n.ID,
-			ParentID: n.ParentID,
-			Required: n.RequiredLevel,
-			Progress: n.Progress,
-			XPNeeded: n.XPNeeded,
-			Rusty:    n.IsRusty,
-		})
-	}
-	return out
-}
-
-// flattenTree orders nodes depth first, the order j and k move through.
+// flattenTree orders nodes depth first, which is top to bottom on the map.
 func flattenTree(nodes []db.Node, statuses map[int64]rpg.Status) []treeRow {
 	children := childrenOf(nodes)
 	var rows []treeRow

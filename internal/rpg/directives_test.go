@@ -104,7 +104,7 @@ func TestBuildDirectivesFillsUnnumberedAnswersInOrder(t *testing.T) {
 }
 
 func TestDirectiveSystemForbidsFillerTitles(t *testing.T) {
-	for _, w := range []string{`"Challenge"`, `"Task"`, `"Study"`, "action verb"} {
+	for _, w := range []string{`"Challenge"`, `"Task"`, `"Study"`, "2 to 5 words", "32 characters", "details"} {
 		if !strings.Contains(directiveSystem, w) {
 			t.Errorf("system prompt should mention %s", w)
 		}

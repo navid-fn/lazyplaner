@@ -169,13 +169,17 @@ func TestTreeNavigationCyclesSkills(t *testing.T) {
 		t.Fatalf("screen = %v, want tree", m.screen)
 	}
 
-	m = send(t, m, key("right"))
+	m = send(t, m, key("tab"))
 	if m.treeSkill != 1 {
 		t.Errorf("treeSkill = %d, want 1", m.treeSkill)
 	}
-	m = send(t, m, key("right"))
+	m = send(t, m, key("tab"))
 	if m.treeSkill != 0 {
 		t.Errorf("treeSkill = %d, want wrap to 0", m.treeSkill)
+	}
+	m = send(t, m, key("shift+tab"))
+	if m.treeSkill != 1 {
+		t.Errorf("shift+tab should wrap back to 1, treeSkill = %d", m.treeSkill)
 	}
 	m = send(t, m, key("t"))
 	if m.screen != screenMain {
@@ -207,9 +211,30 @@ func TestDailyTickOffStartsCompletion(t *testing.T) {
 	m.screen = screenMain
 	m.challenges = []db.Challenge{{ID: 1, Title: "Write a loop", XP: 3}}
 
+	// The first enter only starts the clock.
+	next, cmd := m.Update(key("enter"))
+	m = next.(model)
+	if m.isLoading || m.proof != nil || cmd == nil {
+		t.Fatal("enter on an unstarted directive should start it, not finish it")
+	}
+
+	// Started long ago: enter opens the proof popup, and a note locks it in.
+	m.challenges[0].StartedAt = time.Now().Add(-30 * time.Minute)
 	m = send(t, m, key("enter"))
-	if !m.isLoading {
-		t.Error("enter should start completing the selected challenge")
+	if m.proof == nil || m.isLoading {
+		t.Fatal("enter on a started directive should ask for proof")
+	}
+	if !strings.Contains(m.View(), "What did you build/find?") {
+		t.Error("the proof popup should ask what was done")
+	}
+	m = send(t, m, key("enter"))
+	if m.isLoading || m.proof.err == "" {
+		t.Error("an empty note must not lock in XP")
+	}
+	m = typeText(t, m, "sum loop")
+	m = send(t, m, key("enter"))
+	if !m.isLoading || m.proof != nil {
+		t.Error("enter with a note should finish the directive")
 	}
 
 	m = send(t, m, challengeDoneMsg{event: db.XPEvent{XP: 3, SkillName: "Go"}})
@@ -317,8 +342,9 @@ func TestSetupHelpOpensAndCloses(t *testing.T) {
 	if m.screen != screenHelp || m.prevScreen != screenOnboard {
 		t.Fatalf("? should open help over setup, screen=%v prev=%v", m.screen, m.prevScreen)
 	}
-	if !strings.Contains(m.View(), "Not accepted") {
-		t.Error("help popup should list what is not accepted")
+	if m.helpTab != helpKeys || !strings.Contains(m.View(), "Character & Setup") ||
+		!strings.Contains(m.View(), "you are here") {
+		t.Error("help should open on Keys at the setup section")
 	}
 	// Esc closes help and returns to setup without skipping it.
 	m = send(t, m, key("esc"))
@@ -334,8 +360,13 @@ func TestHelpPopupFromMainWithTabs(t *testing.T) {
 	if m.screen != screenHelp || m.prevScreen != screenMain {
 		t.Fatalf("h should open help over the plan list, screen=%v", m.screen)
 	}
-	if !strings.Contains(m.View(), "Skills") || !strings.Contains(m.View(), "Keys") {
-		t.Error("help should show the tab row")
+	for _, tab := range []string{"Keys", "Game Rules", "AI & Setup"} {
+		if !strings.Contains(m.View(), tab) {
+			t.Errorf("help tab row is missing %q", tab)
+		}
+	}
+	if m.helpTab != helpKeys {
+		t.Errorf("help should open on Keys, helpTab = %d", m.helpTab)
 	}
 
 	if m = send(t, m, key("right")); m.helpTab != 1 {
@@ -355,8 +386,8 @@ func TestHelpPopupFromMainWithTabs(t *testing.T) {
 }
 
 func TestEachHelpTabHasContent(t *testing.T) {
-	for _, name := range helpTabs {
-		if out := helpSection(name, 60); strings.TrimSpace(out) == "" {
+	for i, name := range helpTabs {
+		if out := helpSection(i, groupGlobal); len(out) == 0 {
 			t.Errorf("help tab %q has no content", name)
 		}
 	}
@@ -571,7 +602,8 @@ func TestDirectiveRowsShowTheirTier(t *testing.T) {
 		{ID: 2, Tier: rpg.TierDeepPush, Title: "Write a pool", SkillName: "Go"},
 	}
 	view := m.View()
-	for _, want := range []string{"[⚡ Recon]", "[🔥 Deep Push]", "[⚡ Recon · 15m]"} {
+	// Rows show only the icon; the selected panel has the full badge.
+	for _, want := range []string{"⚡ Sketch eyes", "🔥 Write a pool", "[⚡ Recon · 15m]"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("home screen is missing %q", want)
 		}
@@ -588,21 +620,20 @@ func TestTreeVimKeysMatchArrows(t *testing.T) {
 	m.openTree()
 
 	m = send(t, m, key("l"))
-	if m.treeSkill != 1 {
-		t.Errorf("l should move to the next skill, treeSkill = %d", m.treeSkill)
+	if m.treeSkill != 0 || m.treeNode != 1 {
+		t.Errorf("l should move to the child on the same skill, skill %d node %d", m.treeSkill, m.treeNode)
 	}
 	m = send(t, m, key("h"))
-	if m.treeSkill != 0 {
-		t.Errorf("h should move to the previous skill, treeSkill = %d", m.treeSkill)
-	}
-
-	m = send(t, m, key("j"))
-	if m.treeNode != 1 {
-		t.Errorf("j should move down a node, treeNode = %d", m.treeNode)
-	}
-	m = send(t, m, key("k"))
 	if m.treeNode != 0 {
-		t.Errorf("k should move up a node, treeNode = %d", m.treeNode)
+		t.Errorf("h should move back to the parent, treeNode = %d", m.treeNode)
+	}
+	m = send(t, m, key("right"))
+	if m.treeNode != 1 {
+		t.Errorf("right should match l, treeNode = %d", m.treeNode)
+	}
+	m = send(t, m, key("left"))
+	if m.treeNode != 0 {
+		t.Errorf("left should match h, treeNode = %d", m.treeNode)
 	}
 	m = send(t, m, key("up"))
 	if m.treeNode != 0 {
@@ -754,5 +785,39 @@ func TestCtrlOOpensTheModelPickerEverywhere(t *testing.T) {
 	}
 	if !strings.Contains(m.renderBottomBar(), "ctrl+o") {
 		t.Error("the footer should show ctrl+o next to the model")
+	}
+}
+
+func TestHelpFitsAndScrollsWithinItsTab(t *testing.T) {
+	m := newFlowModel(t)
+	m.onboardChecked = true
+	m.width, m.height = 100, 30
+	m.updateSizes()
+	m.screen = screenNotes
+	m.openHelp()
+	if !strings.Contains(m.View(), "Field Notes") || !strings.Contains(m.View(), "you are here") {
+		t.Error("help opened from the notes should start at the Field Notes keys")
+	}
+	for range 50 {
+		m = send(t, m, key("j"))
+	}
+	if m.helpScroll != m.helpMaxScroll() {
+		t.Errorf("scroll %d should stop at %d", m.helpScroll, m.helpMaxScroll())
+	}
+	for _, tab := range []int{helpKeys, helpRules, helpAI} {
+		m.setHelpTab(tab)
+		lines := strings.Split(m.View(), "\n")
+		if len(lines) != m.height {
+			t.Errorf("tab %d: view is %d lines, want %d", tab, len(lines), m.height)
+		}
+		for i, l := range lines {
+			if w := lipgloss.Width(l); w > m.width {
+				t.Errorf("tab %d: line %d is %d wide", tab, i, w)
+			}
+		}
+	}
+	m = send(t, m, key("esc"))
+	if m.screen != screenNotes {
+		t.Errorf("esc should return to the notes, screen = %v", m.screen)
 	}
 }

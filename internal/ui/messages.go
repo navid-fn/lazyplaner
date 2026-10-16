@@ -25,8 +25,16 @@ type roadLoadedMsg struct {
 	skills []db.Skill
 	nodes  []db.Node
 	events []db.XPEvent
+	eras   []db.Era          // era titles, shown in the tree header
 	stats  db.ChallengeStats // streak and score, shown on the character screen
 	err    error
+}
+
+// eraExpandedMsg says the next era of a skill's tree was saved, or why not.
+type eraExpandedMsg struct {
+	skill string
+	era   int
+	err   error
 }
 
 // treeBuiltMsg says the tree for the pending skill at index was saved, or

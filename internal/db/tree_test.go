@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -147,14 +148,14 @@ func TestCompleteChallengeAwardsOnceAndCountsScore(t *testing.T) {
 		t.Fatalf("unexpected challenges %+v", list)
 	}
 
-	ev, err := store.CompleteChallenge(ctx, list[0].ID)
+	ev, err := store.CompleteChallenge(ctx, list[0].ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ev.XP != 3 || ev.NodeName != "Syntax" {
 		t.Errorf("event = %+v", ev)
 	}
-	if _, err := store.CompleteChallenge(ctx, list[0].ID); err == nil {
+	if _, err := store.CompleteChallenge(ctx, list[0].ID, ""); err == nil {
 		t.Error("completing the same challenge twice should fail")
 	}
 
@@ -194,12 +195,35 @@ func TestStreakEndingAt(t *testing.T) {
 		{"yesterday keeps it alive before today is done", []string{"2026-10-11", "2026-10-12"}, 2},
 		{"old streak is over", []string{"2026-10-09", "2026-10-10"}, 0},
 	}
+	shieldCases := []struct {
+		name    string
+		days    []string
+		shields []string
+		want    int
+	}{
+		{"a shielded sick day bridges the gap", []string{"2026-10-10", "2026-10-11", "2026-10-13"}, []string{"2026-10-12"}, 3},
+		{"a shielded yesterday keeps it alive", []string{"2026-10-10", "2026-10-11"}, []string{"2026-10-12"}, 2},
+		{"a shielded today with nothing done", []string{"2026-10-12"}, []string{"2026-10-13"}, 1},
+		{"a shield does not count as a day", nil, []string{"2026-10-12", "2026-10-13"}, 0},
+	}
+	for _, c := range shieldCases {
+		set, shields := map[string]bool{}, map[string]bool{}
+		for _, d := range c.days {
+			set[day(d)] = true
+		}
+		for _, d := range c.shields {
+			shields[day(d)] = true
+		}
+		if got := streakEndingAt(set, shields, today); got != c.want {
+			t.Errorf("%s: streak = %d, want %d", c.name, got, c.want)
+		}
+	}
 	for _, c := range cases {
 		set := map[string]bool{}
 		for _, d := range c.days {
 			set[day(d)] = true
 		}
-		if got := streakEndingAt(set, today); got != c.want {
+		if got := streakEndingAt(set, nil, today); got != c.want {
 			t.Errorf("%s: streak = %d, want %d", c.name, got, c.want)
 		}
 	}
@@ -297,7 +321,7 @@ func TestADayGetsOneSetAndOneBonus(t *testing.T) {
 		t.Errorf("tiers should round-trip, got %v and %v", list[0].Tier, list[1].Tier)
 	}
 	for _, c := range list {
-		if _, err := store.CompleteChallenge(ctx, c.ID); err != nil {
+		if _, err := store.CompleteChallenge(ctx, c.ID, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -309,7 +333,7 @@ func TestADayGetsOneSetAndOneBonus(t *testing.T) {
 	if len(list) != 3 || list[2].Tier != rpg.TierOvertime || list[2].NodeName != "Syntax" {
 		t.Fatalf("the bonus should join the end of today's list, got %+v", list)
 	}
-	if _, err := store.CompleteChallenge(ctx, list[2].ID); err != nil {
+	if _, err := store.CompleteChallenge(ctx, list[2].ID, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.AddBonusChallenge(ctx, today, bonus); !errors.Is(err, ErrBonusUsed) {
@@ -346,7 +370,7 @@ func TestRerollReplacesOnlyAnOpenDirective(t *testing.T) {
 		t.Fatalf("reroll should replace only the one directive in place, got %+v", after)
 	}
 
-	if _, err := store.CompleteChallenge(ctx, list[0].ID); err != nil {
+	if _, err := store.CompleteChallenge(ctx, list[0].ID, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RerollChallenge(ctx, list[0].ID, NewChallenge{SkillName: "Go", Title: "x"}); err == nil {
@@ -387,8 +411,23 @@ func TestNodeDirectivesAreOnePerNodeAndNotASet(t *testing.T) {
 	if err := store.AddNodeChallenge(ctx, today, focus); err != nil {
 		t.Fatal(err)
 	}
+	// Asking again replaces the open focus directive instead of adding one.
+	again := focus
+	again.Title, again.Details = "Embed an Interface", "- step one"
+	if err := store.AddNodeChallenge(ctx, today, again); err != nil {
+		t.Fatalf("a second ask should reroll the open one: %v", err)
+	}
+	if list, _ := store.ListChallenges(ctx, today); len(list) != 1 || list[0].Title != "Embed an Interface" ||
+		list[0].Details != "- step one" {
+		t.Fatalf("list = %+v, want the one directive rerolled", list)
+	}
+	// Once it is finished, the node is done for the day.
+	list, _ := store.ListChallenges(ctx, today)
+	if _, err := store.CompleteChallenge(ctx, list[0].ID, "embedded io.Reader"); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.AddNodeChallenge(ctx, today, focus); !errors.Is(err, ErrNodeHasDirective) {
-		t.Fatalf("a second directive for the node: got %v, want ErrNodeHasDirective", err)
+		t.Fatalf("a node with a finished directive: got %v, want ErrNodeHasDirective", err)
 	}
 	if err := store.AddNodeChallenge(ctx, today, NewChallenge{SkillName: "Go", Title: "x"}); err == nil {
 		t.Error("a node directive must name a node")
@@ -400,8 +439,121 @@ func TestNodeDirectivesAreOnePerNodeAndNotASet(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("a focus directive must not block the set: %v", err)
 	}
-	list, _ := store.ListChallenges(ctx, today)
+	list, _ = store.ListChallenges(ctx, today)
 	if len(list) != 2 || list[0].Tier != rpg.TierFocus || list[1].Tier != rpg.TierRecon {
 		t.Errorf("list = %+v", list)
+	}
+}
+
+func TestStartThenCompleteKeepsTheProof(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	seedGoTree(t, store)
+	today := Today()
+	if err := store.SaveChallenges(ctx, today, []NewChallenge{{Tier: rpg.TierRecon, SkillName: "Go",
+		NodeName: "Interfaces", Title: "Stringer Drill", Details: "- step", Difficulty: 1, Minutes: 10, XP: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := store.ListChallenges(ctx, today)
+	if list[0].Started() || list[0].Details != "- step" {
+		t.Fatalf("a new directive = %+v", list[0])
+	}
+	first, err := store.StartChallenge(ctx, list[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, _ := store.StartChallenge(ctx, list[0].ID)
+	if !again.Equal(first.Truncate(0)) && again.Sub(first).Abs() > time.Millisecond {
+		t.Errorf("starting twice keeps the first start: %v then %v", first, again)
+	}
+	list, _ = store.ListChallenges(ctx, today)
+	if !list[0].Started() {
+		t.Fatal("the directive should be in progress")
+	}
+
+	ev, err := store.CompleteChallenge(ctx, list[0].ID, "  printed Point(1,2)  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Note != "printed Point(1,2)" {
+		t.Errorf("event note = %q", ev.Note)
+	}
+	list, _ = store.ListChallenges(ctx, today)
+	if list[0].CompletionNote != "printed Point(1,2)" || !list[0].Done {
+		t.Errorf("challenge = %+v", list[0])
+	}
+	events, _ := store.ListXPEvents(ctx, 5)
+	if events[0].Note != "printed Point(1,2)" {
+		t.Errorf("feed note = %q", events[0].Note)
+	}
+	if _, err := store.StartChallenge(ctx, list[0].ID); err == nil {
+		t.Error("a done directive cannot be started")
+	}
+}
+
+func TestFocusDirectivesStopAtTheDailyCap(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	today := Today()
+	// Six skills, one open node each; each gets one focus directive.
+	for i := range 6 {
+		name := fmt.Sprintf("Skill %d", i)
+		if _, err := store.CreateSkillTree(ctx, NewSkillTree{Name: name, Category: "Craft", StartLevel: 1,
+			Nodes: []RoadmapNode{{Parent: -1, Name: "Root", RequiredLevel: 1}}}); err != nil {
+			t.Fatal(err)
+		}
+		err := store.AddNodeChallenge(ctx, today, NewChallenge{SkillName: name, NodeName: "Root", Title: "Drill It", XP: 3})
+		switch {
+		case i < MaxOpenDirectives && err != nil:
+			t.Fatalf("directive %d: %v", i+1, err)
+		case i >= MaxOpenDirectives && !errors.Is(err, ErrDailyCap):
+			t.Fatalf("directive %d: got %v, want ErrDailyCap", i+1, err)
+		}
+	}
+	if list, _ := store.ListChallenges(ctx, today); len(list) != MaxOpenDirectives {
+		t.Errorf("got %d directives, want %d", len(list), MaxOpenDirectives)
+	}
+}
+
+func TestNewSkillsPastTheCapStartFrozen(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	for i := range 5 {
+		sk, err := store.CreateSkillTree(ctx, NewSkillTree{Name: fmt.Sprintf("Skill %d", i), Category: "Craft",
+			StartLevel: 1, Nodes: []RoadmapNode{{Parent: -1, Name: "Root", RequiredLevel: 1}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := i < rpg.MaxActiveSkills; sk.IsActive != want {
+			t.Errorf("skill %d active = %v, want %v", i, sk.IsActive, want)
+		}
+	}
+	skills, _ := store.ListSkills(ctx)
+	var frozen int64
+	active := 0
+	for _, s := range skills {
+		if s.IsActive {
+			active++
+		} else {
+			frozen = s.ID
+		}
+	}
+	if active != rpg.MaxActiveSkills {
+		t.Fatalf("%d active, want %d", active, rpg.MaxActiveSkills)
+	}
+	if err := store.SetSkillActive(ctx, frozen, true); !errors.Is(err, ErrActiveCap) {
+		t.Errorf("a 4th active skill: got %v, want ErrActiveCap", err)
+	}
+	// Freezing one makes room: the swap is two steps.
+	for _, s := range skills {
+		if s.IsActive {
+			if err := store.SetSkillActive(ctx, s.ID, false); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if err := store.SetSkillActive(ctx, frozen, true); err != nil {
+		t.Errorf("after freezing one: %v", err)
 	}
 }

@@ -31,9 +31,12 @@ func (m model) renderBody(s screen) string {
 	case screenModels:
 		return overlay(under(m.modelsReturn), m.renderModelPicker(), m.width, bodyH)
 	case screenHelp:
-		return overlay(under(m.prevScreen), m.renderHelp(), m.width, bodyH)
+		// Help is centered in the whole terminal, footer included.
+		return overlayIn(under(m.prevScreen), m.renderHelp(), m.width, bodyH, m.height)
 	case screenSkillEdit:
 		return overlay(under(m.prevScreen), m.renderSkillEdit(), m.width, bodyH)
+	case screenNoteEdit:
+		return overlay(m.renderBody(screenNotes), m.renderNoteEditor(), m.width, bodyH)
 	}
 
 	base := m
@@ -42,8 +45,13 @@ func (m model) renderBody(s screen) string {
 	switch {
 	case s == screenNewPlan:
 		body = overlay(body, m.renderNewPlan(), m.width, bodyH)
+	case s == screenNotes && m.notes.confirmDelete:
+		body = overlay(body, m.renderNoteDeletePopup(), m.width, bodyH)
 	case m.confirmDelete != nil:
 		body = overlay(body, m.renderDeletePopup(), m.width, bodyH)
+	}
+	if m.proof != nil {
+		body = overlay(body, m.renderProof(), m.width, bodyH)
 	}
 	return body
 }
@@ -68,6 +76,10 @@ func (m model) baseBody() string {
 		return m.renderTreeScreen()
 	case screenOnboard:
 		return m.renderOnboardScreen()
+	case screenNotes:
+		return m.renderNotesScreen()
+	case screenPlanView:
+		return m.renderPlanView()
 	}
 	return m.renderHome()
 }
@@ -181,16 +193,27 @@ func (m model) keyHints() (actions, nav []keyHint) {
 	case screenModels:
 		return []keyHint{{k: "enter", d: "select"}, {k: "r", d: "refresh"}},
 			[]keyHint{{k: "esc/ctrl+o", d: "close"}}
+	case screenPlanView:
+		return []keyHint{{k: "e", d: "edit"}},
+			[]keyHint{{k: "j/k", d: "scroll"}, {k: "g/G", d: "top/end", drop: true}, {k: "esc", d: "back"}, {k: "?", d: "help"}}
 	case screenRoad:
-		return []keyHint{{k: "enter", d: "open tree"}},
+		return []keyHint{{k: "enter", d: "open tree"}, {k: "f", d: "active/frozen"}},
 			[]keyHint{{k: "hjkl", d: "move", drop: true}, {k: "c", d: "back"}, {k: "?", d: "help"}}
 	case screenTree:
 		actions := []keyHint{{k: "enter", d: "complete directive"}}
 		if m.canAskDirective() {
 			actions = append(actions, keyHint{k: "g", d: "new directive"})
 		}
+		era := m.treeEra()
+		if era.CanExpand {
+			actions = append(actions, keyHint{k: "x", d: "expand era"})
+		}
+		nav := []keyHint{{k: "tab", d: "next skill"}, {k: "hjkl", d: "move", drop: true}}
+		if era.Latest > 1 {
+			nav = append(nav, keyHint{k: "[ ]", d: "era", drop: true})
+		}
 		return append(actions, keyHint{k: "e", d: "edit skill", drop: true}),
-			[]keyHint{{k: "←→", d: "skill"}, {k: "↑↓", d: "node"}, {k: "t", d: "back"}, {k: "?", d: "help"}}
+			append(nav, keyHint{k: "t", d: "back"}, keyHint{k: "?", d: "help"})
 	case screenOnboard:
 		f := m.onboard
 		switch {
@@ -206,9 +229,21 @@ func (m model) keyHints() (actions, nav []keyHint) {
 		return []keyHint{{k: "enter", d: "add skill"}, {k: "tab", d: "next field", drop: true}},
 			[]keyHint{{k: "ctrl+r", d: "focus roster"}, {k: "ctrl+s", d: "build trees"}, {k: "?", d: "help", drop: true}, {k: "esc", d: "skip", drop: true}}
 	case screenHelp:
-		return nil, []keyHint{{k: "←→", d: "section"}, {k: "esc", d: "close"}}
+		return nil, []keyHint{{k: "←→", d: "tab"}, {k: "↑↓", d: "scroll"}, {k: "?/esc", d: "close"}}
 	case screenSkillEdit:
 		return []keyHint{{k: "enter", d: "save"}}, []keyHint{{k: "esc", d: "cancel"}}
+	case screenNotes:
+		if m.notes.confirmDelete {
+			return []keyHint{{k: "y", d: "delete"}}, []keyHint{{k: "any key", d: "cancel"}}
+		}
+		actions := []keyHint{{k: "a", d: "new"}, {k: "e", d: "edit"}, {k: "d", d: "delete"},
+			{k: "x", d: "analyze"}, {k: "p", d: "to plan"}}
+		if note, ok := m.selectedNote(); ok && note.Analysis.Claimable() && !note.Claimed() {
+			actions = append(actions, keyHint{k: "c", d: "claim XP"})
+		}
+		return actions, []keyHint{{k: "j/k", d: "move", drop: true}, {k: "n", d: "back"}, {k: "?", d: "help", drop: true}}
+	case screenNoteEdit:
+		return []keyHint{{k: "ctrl+s", d: "save"}}, []keyHint{{k: "esc", d: "cancel"}}
 	}
 
 	if m.confirmDelete != nil {
@@ -218,13 +253,17 @@ func (m model) keyHints() (actions, nav []keyHint) {
 	// also the order they give way in: tree, then character, then the rest.
 	g := m.dailyKeyLabel()
 	if m.mainFocus == focusDirectives {
-		actions = []keyHint{{k: "enter", d: "complete"}, {k: "r", d: "reroll"}}
+		enter := "start"
+		if m.challengeCursor < len(m.challenges) && m.challenges[m.challengeCursor].Started() {
+			enter = "finish"
+		}
+		actions = []keyHint{{k: "enter", d: enter}, {k: "r", d: "reroll"}}
 		if g != "" {
 			actions = append(actions, keyHint{k: "g", d: g})
 		}
 		nav = []keyHint{{k: "tab", d: "plans"}, {k: "ctrl+n", d: "new plan", drop: true}}
 	} else {
-		actions = []keyHint{{k: "ctrl+n", d: "new"}, {k: "e", d: "edit"}, {k: "d", d: "delete"}}
+		actions = []keyHint{{k: "enter", d: "read"}, {k: "e", d: "edit"}, {k: "ctrl+n", d: "new"}, {k: "d", d: "delete"}}
 		nav = []keyHint{{k: "tab", d: "directives"}}
 		if g != "" {
 			nav = append(nav, keyHint{k: "g", d: g, drop: true})
@@ -233,6 +272,7 @@ func (m model) keyHints() (actions, nav []keyHint) {
 	nav = append(nav,
 		keyHint{k: "c", d: "character", drop: true},
 		keyHint{k: "t", d: "tree", drop: true},
+		keyHint{k: "n", d: "notes", drop: true},
 		keyHint{k: "h", d: "help"},
 		keyHint{k: "q", d: "quit"},
 	)

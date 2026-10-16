@@ -57,4 +57,9 @@ func (m *model) updateSizes() {
 
 	pickW, pickH := m.modelPanelSize()
 	m.modelsList.SetSize(max(pickW-2, 10), max(pickH-2, 2))
+
+	m.sizeNoteEditor()
+	if m.screen == screenPlanView {
+		m.layoutPlanView()
+	}
 }

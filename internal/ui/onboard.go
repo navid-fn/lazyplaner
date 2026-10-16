@@ -23,10 +23,9 @@ const (
 	fieldCount
 )
 
-// maxActiveFronts is how many start skills begin active. The rest start
-// garrisoned, so a new player is not handed eight skills to keep from
-// rusting at once.
-const maxActiveFronts = 3
+// maxActiveFronts is how many skills can be active at once (see
+// rpg.MaxActiveSkills). The rest start frozen.
+const maxActiveFronts = rpg.MaxActiveSkills
 
 // levelNames labels the self-rated levels 1 to 5. The rating is also the
 // character's starting level in that skill.
@@ -210,9 +209,7 @@ func (m model) handleOnboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "?":
-		m.prevScreen = screenOnboard
-		m.screen = screenHelp
-		m.helpTab = 0
+		m.openHelp()
 		return m, nil
 
 	case "esc":

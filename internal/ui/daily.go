@@ -3,6 +3,7 @@ package ui
 import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
 	"github.com/navid-fn/lazyplaner/internal/db"
 	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
@@ -83,23 +84,27 @@ func (m model) completeSelectedChallenge() (tea.Model, tea.Cmd) {
 	return m.completeChallenge(m.challenges[m.challengeCursor])
 }
 
-// completeChallenge ticks off one directive and awards its XP. The home
-// screen and the skill tree's inspector both use it.
+// completeChallenge is enter on a directive, from the home screen or the
+// skill tree's inspector: the first press starts it, the second opens the
+// proof popup that finishes it (see proof.go).
 func (m model) completeChallenge(c db.Challenge) (tea.Model, tea.Cmd) {
-	if c.Done {
-		m.statusText = "Already done."
-		return m, nil
-	}
-	m.isLoading = true
-	m.loadingText = "Logging " + c.Title + "…"
 	m.errorText = ""
 	m.statusText = ""
-	return m, tea.Batch(m.spinner.Tick, completeChallengeCmd(m.store, c.ID))
+	switch {
+	case c.Done:
+		m.statusText = "Already done."
+		return m, nil
+	case !c.Started():
+		return m, startChallengeCmd(m.store, c)
+	}
+	cmd := m.openProof(c)
+	return m, cmd
 }
 
-// tierChip is a directive's tier as a short bracketed tag. Directives from
-// before tiers have none.
-func tierChip(t rpg.Tier) string {
+// tierIcon is a directive's tier as its colored icon, for the rows of the
+// day's list; the selected directive's panel shows the full label.
+// Directives from before tiers have none.
+func tierIcon(t rpg.Tier) string {
 	if t == rpg.TierNone {
 		return ""
 	}
@@ -113,8 +118,10 @@ func tierChip(t rpg.Tier) string {
 		ink = colorSuccess
 	case rpg.TierFocus:
 		ink = lipgloss.Color("#8be9fd")
+	case rpg.TierRecovery:
+		ink = colorSuccess
 	}
-	return lipgloss.NewStyle().Foreground(ink).Render("[" + t.Short() + "]")
+	return lipgloss.NewStyle().Foreground(ink).Render(t.Icon())
 }
 
 func plural(n int) string {

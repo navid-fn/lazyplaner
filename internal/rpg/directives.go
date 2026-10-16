@@ -20,6 +20,7 @@ const (
 	TierDeepPush             // deep work milestone
 	TierOvertime             // the day's single bonus, once the set is done
 	TierFocus                // asked for one node from the skill tree
+	TierRecovery             // a light task, the day after a shielded day
 )
 
 // tierSpec is what a tier asks of the model, and the bounds its answer is
@@ -37,6 +38,7 @@ var tierSpecs = map[Tier]tierSpec{
 	TierDeepPush: {"🔥", "Deep Push", "60m", 4, 5, 60, 60, "a deep work milestone that produces something finished"},
 	TierOvertime: {"★", "Bonus Overtime", "30m", 3, 3, 30, 30, "one extra hands-on practice"},
 	TierFocus:    {"🎯", "Focus", "30-45m", 3, 3, 30, 45, "hands-on practice on exactly this node"},
+	TierRecovery: {"🌿", "Recovery", "10-15m", 1, 1, 10, 15, "a gentle low-energy task for someone recovering from illness or burnout, such as light review or reading"},
 }
 
 // Label is the tier as shown on a directive, e.g. "⚡ Recon · 15m". A
@@ -47,6 +49,11 @@ func (t Tier) Label() string {
 		return ""
 	}
 	return s.icon + " " + s.name + " · " + s.time
+}
+
+// Icon is the tier's icon alone, for the rows of the day's list.
+func (t Tier) Icon() string {
+	return tierSpecs[t].icon
 }
 
 // Short is the tier's icon and name, for tight rows.
@@ -92,28 +99,45 @@ func DailySlots(skills []SkillOutline) []DirectiveSlot {
 	return slots
 }
 
+// RecoverySlots is a light day's set after illness or burnout: one gentle
+// Recovery directive on each of the first two skills.
+func RecoverySlots(skills []SkillOutline) []DirectiveSlot {
+	var slots []DirectiveSlot
+	for _, s := range skills[:min(len(skills), recoveryDirectives)] {
+		slots = append(slots, DirectiveSlot{Tier: TierRecovery, Skill: s.Name, Level: s.Level, Nodes: s.Nodes})
+	}
+	return slots
+}
+
+// recoveryDirectives is the size of a recovery day's set.
+const recoveryDirectives = 2
+
 // ChallengeDraft is one generated daily directive, before it is saved.
 type ChallengeDraft struct {
 	Tier        Tier
 	Skill       string
 	Node        string
-	Title       string
-	Description string
+	Title       string // 2-5 words (see ShortenTitle)
+	Description string // the one-sentence definition of done
+	Details     string // markdown execution guide
 	Difficulty  int
 	Minutes     int
 	XP          int
+	TaskID      int64 // the curated node task it is pulled from, 0 for none
 }
 
 const directiveSystem = `You write daily directives for a personal RPG planner.
 A directive is one concrete action the person can finish today in one sitting.
 Title rules:
-- Start with a concrete action verb and name the specific scope, for example
-  "Write a buffered channel worker pool", "Sketch 4 angry/happy eye studies",
-  "Cook pan-seared chicken with pan sauce".
+- 2 to 5 words, at most 32 characters, naming the concrete drill or deliverable,
+  for example "Ghosted Line Drills", "Vector Dunder Methods", "Mutex vs Atomic Bench",
+  "Pan-Seared Chicken Dinner". A short name, NOT a sentence.
 - NEVER end a title with the word "Challenge", "Task" or "Study", and never just
   repeat the node or skill name.
-Every directive needs a description of one or two short sentences, under 160
-characters, that says exactly what to do and how the person will know it is finished.
+description: ONE sentence, under 140 characters: the definition of done.
+details: an execution guide of 3 or 4 markdown bullets ("- "), covering
+1) the setup and steps, 2) the key concepts or commands to use, and
+3) how to verify it is finished.
 Fit each directive to its slot's difficulty and time.`
 
 const directiveSchemaJSON = `{
@@ -130,10 +154,11 @@ const directiveSchemaJSON = `{
           "node":        {"type": "string"},
           "title":       {"type": "string"},
           "description": {"type": "string"},
+          "details":     {"type": "string"},
           "difficulty":  {"type": "integer", "minimum": 1, "maximum": 5},
           "minutes":     {"type": "integer", "minimum": 5, "maximum": 120}
         },
-        "required": ["slot", "node", "title", "description", "difficulty", "minutes"]
+        "required": ["slot", "node", "title", "description", "details", "difficulty", "minutes"]
       }
     }
   },
@@ -146,6 +171,7 @@ type directiveReply struct {
 		Node        string `json:"node"`
 		Title       string `json:"title"`
 		Description string `json:"description"`
+		Details     string `json:"details"`
 		Difficulty  int    `json:"difficulty"`
 		Minutes     int    `json:"minutes"`
 	} `json:"directives"`
@@ -203,7 +229,7 @@ func BuildDirectives(ctx context.Context, g Generator, slots []DirectiveSlot, av
 		}
 		d := reply.Directives[i]
 		slot := slots[s]
-		title := CleanDirectiveTitle(d.Title)
+		title := ShortenTitle(CleanDirectiveTitle(d.Title))
 		if title == "" {
 			continue
 		}
@@ -224,7 +250,8 @@ func BuildDirectives(ctx context.Context, g Generator, slots []DirectiveSlot, av
 			Skill:       slot.Skill,
 			Node:        node,
 			Title:       title,
-			Description: strings.TrimSpace(d.Description),
+			Description: ShortenSummary(d.Description),
+			Details:     CleanDetails(d.Details),
 			Difficulty:  diff,
 			Minutes:     mins,
 			XP:          Award(Activity{Difficulty: diff, Minutes: mins}),

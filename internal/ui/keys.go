@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -12,6 +13,9 @@ func (m model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.isEditing {
 		return m, nil
+	}
+	if m.proof != nil {
+		return m.handleProofKey(msg)
 	}
 	// ctrl+o picks the model from anywhere; the picker handles it itself
 	// (it closes the picker).
@@ -33,6 +37,12 @@ func (m model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleHelpKey(msg)
 	case screenSkillEdit:
 		return m.handleSkillEditKey(msg)
+	case screenNotes:
+		return m.handleNotesKey(msg)
+	case screenPlanView:
+		return m.handlePlanViewKey(msg)
+	case screenNoteEdit:
+		return m.handleNoteEditKey(msg)
 	}
 	return m.handleMainKey(msg)
 }
@@ -70,6 +80,9 @@ func (m model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "t":
 		m.openTree()
 		return m, nil
+	case "n":
+		cmd := m.openNotes()
+		return m, cmd
 	case "g":
 		cmd := m.startDailyJob()
 		return m, cmd
@@ -85,6 +98,13 @@ func (m model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		if !m.isLoading {
 			return m.handleEditStart()
+		}
+	case "enter":
+		// enter on a plan opens the reader; while the list is being
+		// filtered, enter belongs to the filter.
+		if m.mainFocus == focusPlans && m.plansList.FilterState() != list.Filtering {
+			m.openPlanView()
+			return m, nil
 		}
 	}
 

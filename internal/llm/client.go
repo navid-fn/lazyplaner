@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/navid-fn/lazyplaner/internal/config"
 )
 
 type Client struct {
@@ -29,7 +31,7 @@ func NewClient(baseURL string, model string) *Client {
 		trimmedBaseURL = "http://localhost:11434"
 	}
 	if trimmedModel == "" {
-		trimmedModel = "llama3.2"
+		trimmedModel = config.DefaultOllamaModel
 	}
 
 	return &Client{

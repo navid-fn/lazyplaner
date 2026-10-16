@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/navid-fn/lazyplaner/internal/db"
+	"github.com/navid-fn/lazyplaner/internal/game"
 	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
 
@@ -133,7 +134,7 @@ func TestApplyRustMarksStaleActiveSkills(t *testing.T) {
 	}
 
 	// Ten days on, nothing has gone 14 days without practice.
-	if err := applyRust(ctx, store, time.Now().Add(10*24*time.Hour)); err != nil {
+	if err := game.ApplyRust(ctx, store, time.Now().Add(10*24*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if r := rustyNodes(); len(r) != 0 {
@@ -143,7 +144,7 @@ func TestApplyRustMarksStaleActiveSkills(t *testing.T) {
 	// Three weeks on, the active skills rust at their frontier; the
 	// garrisoned one does not.
 	later := time.Now().Add(21 * 24 * time.Hour)
-	if err := applyRust(ctx, store, later); err != nil {
+	if err := game.ApplyRust(ctx, store, later); err != nil {
 		t.Fatal(err)
 	}
 	rusty := rustyNodes()
@@ -158,7 +159,7 @@ func TestApplyRustMarksStaleActiveSkills(t *testing.T) {
 	}
 
 	// Running it again changes nothing.
-	if err := applyRust(ctx, store, later); err != nil {
+	if err := game.ApplyRust(ctx, store, later); err != nil {
 		t.Fatal(err)
 	}
 	if len(rustyNodes()) != len(rusty) {
@@ -175,7 +176,7 @@ func TestTreeShowsRustyNode(t *testing.T) {
 		{ID: 2, SkillID: 1, ParentID: 1, Name: "Interfaces", RequiredLevel: 2, XPNeeded: 80, IsRusty: true},
 	}
 	m.openTree()
-	m = send(t, m, key("j")) // select Interfaces
+	m = send(t, m, key("l")) // select Interfaces
 
 	view := m.View()
 	for _, want := range []string{"⚠ Rusty ▸ Interfaces", "RUSTY", "comeback"} {

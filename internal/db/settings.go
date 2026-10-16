@@ -7,6 +7,22 @@ import (
 	"fmt"
 )
 
+// modelKey is the settings key of the model chosen in the picker.
+const modelKey = "ollama_model"
+
+// GetSelectedModel returns the model saved from the picker, or "" when none
+// has been saved.
+func (s *Store) GetSelectedModel(ctx context.Context) (string, error) {
+	name, _, err := s.GetSetting(ctx, modelKey)
+	return name, err
+}
+
+// SetSelectedModel saves the model chosen in the picker, so it is used again
+// on the next start.
+func (s *Store) SetSelectedModel(ctx context.Context, name string) error {
+	return s.SetSetting(ctx, modelKey, name)
+}
+
 // GetSetting returns the value stored under key, and whether it exists.
 func (s *Store) GetSetting(ctx context.Context, key string) (string, bool, error) {
 	var value string

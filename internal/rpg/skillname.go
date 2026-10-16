@@ -15,6 +15,11 @@ const (
 	MaxStartSkills = 8
 )
 
+// MaxActiveSkills is how many skills can be active fronts at once. Only
+// active skills get directives and rust; a skill added past the cap starts
+// frozen (garrisoned) until the person swaps it in.
+const MaxActiveSkills = 3
+
 // skillNameSymbols are the non-letter, non-digit characters allowed in a
 // skill name, such as C++, C#, CI/CD, R&D or Node.js.
 const skillNameSymbols = "+#.-/&'"

@@ -28,7 +28,7 @@ func NewStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("db path is required")
 	}
 
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
@@ -43,6 +43,27 @@ func NewStore(path string) (*Store, error) {
 	}
 
 	return store, nil
+}
+
+// connPragmas run on every new connection. WAL lets the TUI and the CLI use
+// the database at the same time: readers never block the writer. A writer
+// that finds another writer waits up to busy_timeout instead of failing
+// with SQLITE_BUSY, and _txlock=immediate takes the write lock when a
+// transaction begins, so two transactions cannot deadlock upgrading from
+// read to write.
+var connPragmas = []string{"journal_mode(WAL)", "busy_timeout(5000)", "synchronous(NORMAL)"}
+
+// dsn adds the connection pragmas to a database path.
+func dsn(path string) string {
+	params := "_txlock=immediate"
+	for _, p := range connPragmas {
+		params += "&_pragma=" + p
+	}
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + params
 }
 
 func (s *Store) Close() error {
@@ -116,6 +137,35 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);`,
+		// Curated tasks an external agent designed for a node, done in
+		// position order. A directive pulled from one points back at it
+		// through challenges.node_task_id.
+		`CREATE TABLE IF NOT EXISTS node_tasks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			skill_id INTEGER NOT NULL REFERENCES skills(id),
+			node_id INTEGER NOT NULL REFERENCES skill_nodes(id),
+			position INTEGER NOT NULL,
+			title TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			difficulty INTEGER NOT NULL,
+			minutes INTEGER NOT NULL,
+			is_completed INTEGER NOT NULL DEFAULT 0
+		);`,
+		// The title of each era after the first, when one was given.
+		`CREATE TABLE IF NOT EXISTS skill_eras (
+			skill_id INTEGER NOT NULL REFERENCES skills(id),
+			era INTEGER NOT NULL,
+			title TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			PRIMARY KEY (skill_id, era)
+		);`,
+		// Daily notes. created_at is the note's date and never changes.
+		`CREATE TABLE IF NOT EXISTS notes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			body TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
 	)
 
 	for _, stmt := range statements {
@@ -149,13 +199,44 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		{"skills", "is_active", "INTEGER NOT NULL DEFAULT 1"},
 		{"skills", "last_practiced_at", "TEXT"},
 		{"skill_nodes", "is_rusty", "INTEGER NOT NULL DEFAULT 0"},
+		// What the note analyzer read from a note. status is '' until the
+		// note is analyzed; xp_event_id is the XP claimed from it, 0 if none.
+		{"notes", "status", "TEXT NOT NULL DEFAULT ''"},
+		{"notes", "shield", "INTEGER NOT NULL DEFAULT 0"},
+		{"notes", "skill_name", "TEXT NOT NULL DEFAULT ''"},
+		{"notes", "minutes", "INTEGER NOT NULL DEFAULT 0"},
+		{"notes", "follow_up", "TEXT NOT NULL DEFAULT ''"},
+		{"notes", "xp_event_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"notes", "claimed_xp", "INTEGER NOT NULL DEFAULT 0"},
+		// The curated task a directive was pulled from, 0 for none.
+		{"challenges", "node_task_id", "INTEGER NOT NULL DEFAULT 0"},
+		// Multi-era trees. A tree grows in eras of rpg.RoadmapSize nodes;
+		// era 1 is the first tree. extra_parent_id is a node's second
+		// parent (0 for none), which closes each era's diamond. is_capstone
+		// marks the node an era ends on and the next era grows from.
+		{"skill_nodes", "era", "INTEGER NOT NULL DEFAULT 1"},
+		{"skill_nodes", "extra_parent_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"skill_nodes", "is_capstone", "INTEGER NOT NULL DEFAULT 0"},
+		// A directive's and a curated task's execution guide (markdown).
+		{"challenges", "details", "TEXT NOT NULL DEFAULT ''"},
+		{"node_tasks", "details", "TEXT NOT NULL DEFAULT ''"},
+		// A directive is started before it is finished: started_at is when
+		// (RFC 3339, NULL until started), completion_note is the proof the
+		// person wrote when finishing it. xp_events.note keeps that proof
+		// with the award.
+		{"challenges", "started_at", "TEXT"},
+		{"challenges", "completion_note", "TEXT NOT NULL DEFAULT ''"},
+		{"xp_events", "note", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, mg := range migrations {
 		if err := s.addColumnIfMissing(ctx, mg.table, mg.column, mg.definition); err != nil {
 			return err
 		}
 	}
-	return s.backfillLastPracticed(ctx)
+	if err := s.backfillLastPracticed(ctx); err != nil {
+		return err
+	}
+	return s.backfillDiamonds(ctx)
 }
 
 // addColumnIfMissing adds a column to a table that was created by an older

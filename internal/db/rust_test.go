@@ -145,7 +145,7 @@ func TestCompletingAChallengeOnARustyNodeCountsTheBonus(t *testing.T) {
 	}
 	list, _ := store.ListChallenges(ctx, today)
 
-	ev, err := store.CompleteChallenge(ctx, list[0].ID)
+	ev, err := store.CompleteChallenge(ctx, list[0].ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}

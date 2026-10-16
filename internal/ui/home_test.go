@@ -1,12 +1,15 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/navid-fn/lazyplaner/internal/db"
+	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
 
 // homeModel is the home screen with two skills, two directives (one done),
@@ -90,9 +93,28 @@ func TestTabSwitchesFocusAndKeysFollowIt(t *testing.T) {
 func TestEnterCompletesDirectiveFromHome(t *testing.T) {
 	m := homeModel(t, 160, 40)
 	m = send(t, m, key("enter"))
-	if !m.isLoading {
-		t.Fatal("enter on an open directive should start completing it")
+	if m.isLoading || m.proof != nil {
+		t.Fatal("the first enter only starts the directive")
 	}
+	m.challenges[0].StartedAt = time.Now().Add(-time.Minute)
+	if !strings.Contains(m.View(), "[▶]") {
+		t.Error("a started directive shows [▶] in its row")
+	}
+	m = send(t, m, key("enter"))
+	if m.proof == nil || !strings.Contains(m.View(), "Completed in <2m") {
+		t.Fatal("finishing within 2 minutes should warn in the proof popup")
+	}
+	m = typeText(t, m, "short")
+	m = send(t, m, key("enter"))
+	if m.isLoading {
+		t.Error("a quick finish needs a note of at least 10 characters")
+	}
+	m = typeText(t, m, " but real")
+	m = send(t, m, key("enter"))
+	if !m.isLoading {
+		t.Fatal("a long enough note locks in the XP")
+	}
+	m = send(t, m, key("esc"))
 
 	m = homeModel(t, 160, 40)
 	m.challengeCursor = 1 // the done one
@@ -155,15 +177,43 @@ func TestHomeFitsTheTerminal(t *testing.T) {
 	}
 }
 
-func TestBriefingShowsNextMoves(t *testing.T) {
+func TestBriefingShowsTheExecutionGuide(t *testing.T) {
 	m := homeModel(t, 186, 50)
+	m.challenges[0].Details = "- Write `wrap(err)` with **%w**\n- Run go test ./...\n- Done when errors.Is passes"
 	view := m.View()
-	if !strings.Contains(view, "Next Moves") {
-		t.Fatal("the briefing should have a Next Moves section")
+	if strings.Contains(view, "Next Moves") {
+		t.Error("Next Moves is replaced by the execution guide")
 	}
-	// Go has a rusty node, so its next move is clearing the rust.
-	if !strings.Contains(view, "⚠ rusty ▸ Errors") {
-		t.Error("a rusty skill's next move should be its rusty node")
+	for _, want := range []string{"Execution Guide", "• Write wrap(err) with %w", "• Done when errors.Is passes"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("the briefing should show %q", want)
+		}
+	}
+}
+
+func TestDirectivesListScrollsWithTheCursor(t *testing.T) {
+	m := homeModel(t, 120, 36)
+	m.challenges = nil
+	for i := range 12 {
+		m.challenges = append(m.challenges, db.Challenge{ID: int64(i + 1), Tier: rpg.TierFocus,
+			SkillName: "Go", Category: "Craft", Title: fmt.Sprintf("Drill Number %02d", i+1), XP: 5})
+	}
+	view := m.View()
+	if !strings.Contains(view, "Drill Number 01") || strings.Contains(view, "Drill Number 12") {
+		t.Fatal("the list should start at the top")
+	}
+	if !strings.Contains(view, "↓ more (1/12)") {
+		t.Error("hidden rows should be announced")
+	}
+	for range 11 {
+		m = send(t, m, key("down"))
+	}
+	view = m.View()
+	if !strings.Contains(view, "Drill Number 12") || strings.Contains(view, "Drill Number 01") {
+		t.Error("the list should scroll to keep the cursor in view")
+	}
+	if !strings.Contains(view, "↑ more (12/12)") {
+		t.Error("the indicator should say where the cursor is")
 	}
 }
 
@@ -194,5 +244,41 @@ func TestKeyBarFitsAndKeepsTheEssentials(t *testing.T) {
 		if strings.Contains(bar, ":latest") {
 			t.Errorf("width %d: the default tag should be dropped", w)
 		}
+	}
+}
+
+func TestEnterOnAPlanOpensTheReader(t *testing.T) {
+	m := homeModel(t, 160, 40)
+	m.setPlans([]db.Plan{{ID: 7, Subject: "Learn generics", CreatedAt: time.Now(),
+		Description: "# Generics Plan\n\n## Steps\n\n- Read the **spec**\n- Write `Map[K, V]`\n\n| Week | Topic |\n| --- | --- |\n| 1 | Constraints |\n" +
+			strings.Repeat("\nMore notes line.\n", 40)}})
+	m = send(t, m, key("tab"))
+	m = send(t, m, key("enter"))
+	if m.screen != screenPlanView || m.isEditing {
+		t.Fatalf("enter on a plan should open the reader, not the editor: screen=%v editing=%v", m.screen, m.isEditing)
+	}
+	view := m.View()
+	for _, want := range []string{"Learn generics", "Generics Plan", "Read the spec", "Constraints", "esc back"} {
+		if !strings.Contains(ansi.Strip(view), want) {
+			t.Errorf("the reader should show %q", want)
+		}
+	}
+	if strings.Contains(view, "**spec**") || strings.Contains(view, "| --- |") {
+		t.Error("markdown should be rendered, not shown raw")
+	}
+	for i, line := range strings.Split(view, "\n") {
+		if w := lipgloss.Width(line); w > m.width {
+			t.Errorf("line %d is %d wide, wider than %d", i, w, m.width)
+		}
+	}
+
+	// It scrolls, and esc goes back to the plan list.
+	m = send(t, m, key("G"))
+	if m.planView.vp.YOffset == 0 {
+		t.Error("G should scroll to the end")
+	}
+	m = send(t, m, key("esc"))
+	if m.screen != screenMain || m.mainFocus != focusPlans {
+		t.Error("esc should return to the plan list")
 	}
 }

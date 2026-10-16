@@ -2,6 +2,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -11,7 +12,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/navid-fn/lazyplaner/internal/db"
+	"github.com/navid-fn/lazyplaner/internal/game"
 	"github.com/navid-fn/lazyplaner/internal/llm"
+	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
 
 // ─── Screens ─────────────────────────────────────────────────────────────────
@@ -29,6 +32,9 @@ const (
 	screenTree
 	screenHelp
 	screenSkillEdit
+	screenNotes
+	screenNoteEdit
+	screenPlanView // the selected plan's markdown, full screen
 )
 
 // newPlanForm holds the inputs of the New Plan window.
@@ -56,6 +62,9 @@ type model struct {
 	plans           []db.Plan
 	skills          []db.Skill
 	nodes           []db.Node
+	eras            []db.Era
+	proof           *proofForm // the open proof-of-work popup, if any
+	planView        planViewer // the plan reader (screenPlanView)
 	xpEvents        []db.XPEvent
 	challenges      []db.Challenge
 	challengeStats  db.ChallengeStats
@@ -66,8 +75,10 @@ type model struct {
 	mainFocus       homeFocus // which left panel on the home screen has keys
 	treeReturn      screen    // where leaving the tree goes back to
 	onboard         onboardForm
+	notes           notesState
 	skillEdit       skillEditForm
 	helpTab         int
+	helpScroll      int    // first line of the help tab shown
 	dailyBusy       string // set while the model works on today's directives
 	onboardChecked  bool
 	modelsList      list.Model
@@ -125,6 +136,7 @@ func NewModel(store *db.Store, client *llm.Client) model {
 	return model{
 		spinner:       sp,
 		newPlan:       newPlanForm{subject: subjectInput, description: descInput},
+		notes:         notesState{editor: newNoteEditor()},
 		plansList:     plansList,
 		plansByID:     map[int64]db.Plan{},
 		modelsList:    modelsList,
@@ -154,10 +166,13 @@ func newListDelegate() list.DefaultDelegate {
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(loadPlansCmd(m.store), loadModelsCmd(m.client), loadRoadCmd(m.store),
-		loadDailyCmd(m.store))
+		loadDailyCmd(m.store), loadNotesCmd(m.store, 0))
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if next, cmd, ok := m.handleNotesMsg(msg); ok {
+		return next, cmd
+	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKeyMsg(msg)
@@ -170,9 +185,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case spinner.TickMsg:
 		// Stop the animation once nothing is running. A skill audit on the
-		// setup screen and a directive job run without blocking the screen,
-		// so they keep the spinner too.
-		if !m.isLoading && !m.onboard.busy() && m.dailyBusy == "" {
+		// setup screen, a directive job and a note analysis run without
+		// blocking the screen, so they keep the spinner too.
+		if !m.isLoading && !m.onboard.busy() && m.dailyBusy == "" && m.notes.analyzing == 0 {
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -191,6 +206,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.setModels(msg.models)
+		cmd := m.ensureInstalledModel()
+		return m, cmd
+	case modelSavedMsg:
+		if msg.err != nil {
+			m.errorText = fmt.Sprintf("Failed to save the model choice: %v", msg.err)
+		}
 		return m, nil
 	case planSavedMsg:
 		m.isLoading = false
@@ -217,6 +238,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.errorText = ""
 		m.statusText = "Description updated."
 		m.updatePlanInList(msg.plan)
+		if m.screen == screenPlanView && m.planView.plan.ID == msg.plan.ID {
+			m.planView.plan = msg.plan
+			m.layoutPlanView()
+		}
 		return m, nil
 	case planDeletedMsg:
 		m.isLoading = false
@@ -234,6 +259,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.setRoad(msg.skills, msg.nodes, msg.events)
+		m.eras = msg.eras
 		m.challengeStats = msg.stats
 		m.refreshPlanItems()
 		// Setup opens on the first load when there is no character yet.
@@ -263,6 +289,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case treeBuiltMsg:
 		return m.handleTreeBuilt(msg)
+	case stanceMsg:
+		if msg.err != nil {
+			m.errorText = msg.err.Error()
+			if errors.Is(msg.err, db.ErrActiveCap) {
+				m.errorText = fmt.Sprintf("%d skills are active. Press f on one to freeze it, then activate %s.",
+					rpg.MaxActiveSkills, msg.name)
+			}
+			return m, nil
+		}
+		m.statusText = msg.name + " moved to the garrison: frozen, no directives, no rust."
+		if msg.active {
+			m.statusText = msg.name + " is now an active front."
+		}
+		return m, loadRoadCmd(m.store)
+	case eraExpandedMsg:
+		m.dailyBusy = ""
+		if msg.err != nil {
+			m.errorText = msg.err.Error()
+			return m, nil
+		}
+		m.errorText = ""
+		m.statusText = fmt.Sprintf("Era %s of %s is open. Its foundations grow from the last capstone.",
+			game.RomanEra(msg.era), msg.skill)
+		return m, loadRoadCmd(m.store)
 	case challengesLoadedMsg:
 		m.dailyBusy = ""
 		// A failed job still carries today's list as it stands.

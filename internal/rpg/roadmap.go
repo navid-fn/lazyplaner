@@ -11,10 +11,15 @@ import (
 // RoadNode is one node of a generated skill tree. Parent is the index of the
 // parent node in the same slice, or -1 for a node that hangs off the skill.
 type RoadNode struct {
-	Parent        int
+	Parent int
+	// MoreParents are the indexes of further parents in the same slice. A
+	// node with more than one parent opens only once all of them are done.
+	MoreParents   []int
+	Capstone      bool // the last node of its era, which the next era grows from
 	Name          string
 	Description   string
 	RequiredLevel int
+	Tasks         []CuratedTask // curated tasks from an external agent, in order
 }
 
 // RoadmapSize is how many sub-skills the model is asked for.
@@ -22,19 +27,40 @@ const RoadmapSize = 8
 
 // The tree's shape is fixed in code, because small models chain every node
 // into one line when asked for parents. treeParents gives each of the eight
-// nodes, in learning order, the index of its parent (-1 for the skill):
+// nodes, in learning order, the index of its parent (-1 for the skill), and
+// treeJoins the second parent of the nodes that close the diamond:
 //
-//	column 1: 0 1        two roots
-//	column 2: 2 3 ← 0,   4 ← 1
-//	column 3: 5 ← 3,     6 ← 4
-//	column 4: 7 ← 5      the capstone
+//	column 1   column 2      column 3      column 4
+//	node 0 ──┬─ node 2 ──┐
+//	         └─ node 3 ──┼── node 5 ──┐
+//	                     └─┐          ├── node 7 (capstone)
+//	node 1 ──── node 4 ────┴─ node 6 ─┘
 //
-// Every parent comes before its children, so a shorter reply keeps a valid
-// tree by taking the first nodes.
+// So node 5 needs nodes 2 and 3, node 6 needs nodes 3 and 4, and the
+// capstone needs nodes 5 and 6: no branch is a dead end. The first parent
+// draws the tree; the second is a joining line. Every parent comes before
+// its children, so a shorter reply keeps a valid tree by taking the first
+// nodes.
 var (
 	treeParents = [RoadmapSize]int{-1, -1, 0, 0, 1, 3, 4, 5}
+	treeJoins   = map[int]int{5: 2, 6: 3, 7: 6}
 	treeColumn  = [RoadmapSize]int{1, 1, 2, 2, 2, 3, 3, 4}
+	// eraOffsets is each node's required level above the base level of an
+	// era after the first, the same climb as a fresh level-1 tree.
+	eraOffsets = [RoadmapSize]int{0, 0, 1, 1, 1, 3, 3, 5}
 )
+
+// wire sets the parents and the capstone flag of the node at index i of a
+// tree of size nodes.
+func wire(n RoadNode, i, size int) RoadNode {
+	n.Parent = treeParents[i]
+	n.MoreParents = nil
+	if j, ok := treeJoins[i]; ok && j < size {
+		n.MoreParents = []int{j}
+	}
+	n.Capstone = i == size-1
+	return n
+}
 
 // roadmapSystem names no other domain on purpose: small models copy any
 // example they are given into the tree.
@@ -114,6 +140,51 @@ func BuildRoadmap(ctx context.Context, g Generator, skill string, level int, goa
 	return category, shapeTree(nodes, level), nil
 }
 
+// BuildEraRoadmap asks the model for the next era of a skill's tree: the
+// sub-skills that come after everything in done, the names of the nodes the
+// tree already has. base is the level the era starts at (see
+// EraBaseLevel). Names the tree already uses are dropped, so the era can
+// come back shorter than RoadmapSize; the shape still holds (see ShapeEra).
+func BuildEraRoadmap(ctx context.Context, g Generator, skill string, era, base int, goal string, done []string) ([]RoadNode, error) {
+	skill = strings.TrimSpace(skill)
+	if len(done) > 24 {
+		done = done[len(done)-24:] // the latest eras say most about what comes next
+	}
+	prompt := fmt.Sprintf(
+		"Skill: %[1]s\nCurrent level: %[2]d.\n%[3]s"+
+			"The person has already worked through these sub-skills of %[1]s: %[4]s.\n"+
+			"Pick the category that fits %[1]s: Mind, Body, Craft, Social or Life.\n"+
+			"List exactly %[5]d NEW, more advanced sub-skills of %[1]s for era %[6]d of their training, "+
+			"building on what they already have. Never repeat or rename a sub-skill above. "+
+			"Every node must be strictly about %[1]s.%[7]s",
+		skill, max(base, 1), goalClause(goal), strings.Join(done, "; "), RoadmapSize, era, goalReminder(goal),
+	)
+	raw, err := g.GenerateJSON(ctx, roadmapSystem, prompt, json.RawMessage(roadmapSchemaJSON))
+	if err != nil {
+		return nil, fmt.Errorf("build era %d for %s: %w", era, skill, err)
+	}
+	var reply roadmapReply
+	if err := json.Unmarshal([]byte(raw), &reply); err != nil {
+		return nil, fmt.Errorf("parse era %d for %s: %w", era, skill, err)
+	}
+	taken := map[string]bool{}
+	for _, name := range done {
+		taken[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	kept := reply.Nodes[:0]
+	for _, n := range reply.Nodes {
+		if !taken[strings.ToLower(strings.TrimSpace(n.Name))] {
+			kept = append(kept, n)
+		}
+	}
+	reply.Nodes = kept
+	nodes, err := cleanRoadmap(reply, skill)
+	if err != nil {
+		return nil, err
+	}
+	return ShapeEra(nodes, base), nil
+}
+
 // cleanRoadmap keeps the named, distinct nodes in order, at most
 // RoadmapSize of them.
 func cleanRoadmap(reply roadmapReply, skill string) ([]RoadNode, error) {
@@ -153,8 +224,28 @@ func shapeTree(nodes []RoadNode, startLevel int) []RoadNode {
 	l := max(startLevel, 1)
 	out := make([]RoadNode, len(nodes))
 	for i, n := range nodes {
-		n.Parent = treeParents[i]
+		n = wire(n, i, len(nodes))
 		n.RequiredLevel = nodeLevel(i, l)
+		out[i] = n
+	}
+	return out
+}
+
+// EraBaseLevel is the level the foundations of a new era require: the
+// skill's level, but at least one above the capstone the era grows from.
+func EraBaseLevel(skillLevel, capstoneRequired int) int {
+	return max(skillLevel, capstoneRequired+1, 1)
+}
+
+// ShapeEra wires the nodes of an era after the first into the same diamond
+// as a fresh tree, with required levels climbing from base (see
+// EraBaseLevel). The two foundations get Parent -1: they hang off the
+// capstone of the era before, which the caller links them to.
+func ShapeEra(nodes []RoadNode, base int) []RoadNode {
+	out := make([]RoadNode, len(nodes))
+	for i, n := range nodes {
+		n = wire(n, i, len(nodes))
+		n.RequiredLevel = base + eraOffsets[i]
 		out[i] = n
 	}
 	return out

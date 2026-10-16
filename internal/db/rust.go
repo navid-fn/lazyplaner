@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/navid-fn/lazyplaner/internal/rpg"
 )
 
 // practicedLayout is how skills.last_practiced_at is written.
@@ -91,9 +93,33 @@ func (s *Store) SetNodeRusty(ctx context.Context, id int64, rusty bool) error {
 	return nil
 }
 
+// ErrActiveCap is returned when a skill is made active while
+// rpg.MaxActiveSkills others already are.
+var ErrActiveCap = fmt.Errorf("%d skills are already active; freeze one first", rpg.MaxActiveSkills)
+
+// activeSkillsTx counts the active skills.
+func activeSkillsTx(ctx context.Context, q querier) (int, error) {
+	var n int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM skills WHERE is_active = 1`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count active skills: %w", err)
+	}
+	return n, nil
+}
+
 // SetSkillActive puts a skill in the active stance (it can rust) or the
-// garrisoned stance (it is parked and never rusts).
+// garrisoned stance (it is parked and never rusts). A skill is made active
+// only while fewer than rpg.MaxActiveSkills others are (ErrActiveCap).
 func (s *Store) SetSkillActive(ctx context.Context, id int64, active bool) error {
+	if active {
+		var n int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM skills WHERE is_active = 1 AND id != ?`, id).Scan(&n); err != nil {
+			return fmt.Errorf("count active skills: %w", err)
+		}
+		if n >= rpg.MaxActiveSkills {
+			return ErrActiveCap
+		}
+	}
 	result, err := s.db.ExecContext(ctx,
 		`UPDATE skills SET is_active = ? WHERE id = ?`, boolInt(active), id)
 	if err != nil {
