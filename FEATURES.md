@@ -9,8 +9,11 @@ up a character. Everything is stored locally in SQLite.
 - **AI backend:** Ollama HTTP API (`/api/tags`, `/api/generate`), no cloud
   service
 - **Config (env vars):** `LAZYPLANER_DB_PATH` (default `./lazyplaner.db`),
-  `OLLAMA_BASE_URL` (default `http://localhost:11434`), `OLLAMA_MODEL` (default
-  `llama3.2`)
+  `OLLAMA_BASE_URL` (default `http://localhost:11434`), `OLLAMA_MODEL`. The model
+  is resolved as `OLLAMA_MODEL`, else the one saved from the picker
+  (`settings.ollama_model`), else `deepseek-v2:latest`; if that is not
+  installed, the first time Ollama lists its models the app switches to
+  `deepseek-v2:latest` or the first installed model and saves it
 - **Run:** `go run .` (alt-screen, mouse enabled)
 
 ## 0. Home screen (command center)
@@ -175,7 +178,8 @@ root). The status bar reports what was earned.
   directives join today's list but are not the day's set.
 - A leaf that is not the capstone is labelled **side branch**: nothing grows
   from it, but its XP counts toward the level that opens the next column.
-- Keys: `←/→` or `h/l` (or tab) switch skill, `↑/↓` or `j/k` move between nodes,
+- Keys: `tab`/`shift+tab` switch skill; `hjkl` or the arrows walk the map
+  (`h` parent, `l` first child, `j`/`k` next card down/up in the column),
   `enter` complete the node's directive, `e` edit the skill, `?` help, `t`/`esc`
   back. The bottom key bar lists them. Mouse is enabled.
 
@@ -221,6 +225,90 @@ root). The status bar reports what was earned.
   today doesn't break the streak until the day is over).
 - Days use the local date.
 
+## 4b. Field Log — daily notes (`n`)
+
+Free-form daily notes that feed the game.
+
+- **Note analyzer** (`rpg.AnalyzeNote`, selected model, flat JSON): runs when a
+  note is saved and on `x`. It reports `mood_or_status` (Normal, Energized,
+  Sick, Exhausted, Blocked), `protect_streak`, `detected_skill_name`,
+  `estimated_minutes` and `follow_up_action`. Code checks the answer: the
+  skill must be an existing one (never created from a note), minutes are
+  capped, and the streak shield follows the status, not the model's flag.
+  Editing a note clears its analysis; the save re-runs it.
+- **Auto-shield:** a Sick or Exhausted note shields its day. A shielded day
+  with nothing done is frozen: it neither adds to the streak nor breaks it.
+  The HUD shows `🛡️ Streak` while today is shielded. When today's set is
+  generated after a shielded day (or on the shielded day itself), it is a
+  🌿 Recovery set: two 10-15 minute difficulty-1 directives.
+- **Retroactive XP:** a note with work on an existing skill can be claimed once
+  with `c`/`enter`: `rpg.Award` at difficulty 2 for the estimated minutes,
+  recorded as an XP event `📝 <first line>`. Edits keep the claim.
+- **List** (left): newest first, grouped by day (`Today`, `Yesterday`, then the
+  date) with a day badge — `[🛡️ Sick]` for a shielded day, else
+  `[🔥 +N XP]` for XP earned that day. Each row has a signifier: `!` blocker
+  (red for illness/burnout, amber for blocked), `★` win (claimable work),
+  `•` reflection, `·` not analyzed yet.
+- **Note** (right): date and status badge, the text, then
+  **🤖 Strategist Analysis** (status and what it means for the streak, XP to
+  claim, follow-up) and **📊 Day Snapshot** (directives done/set, XP earned and
+  skills practised on the note's date, and the shield).
+- **To plan:** `p` saves the note as a plan: the follow-up as its subject when
+  there is one, else the note's first line; the description quotes the note.
+  It earns no XP.
+- **Keys:** `a`/`ctrl+n` new, `e` edit, `d` delete (asks `y`), `x` analyze,
+  `c`/`enter` claim XP, `p` to plan, `j`/`k` move, `n`/`esc` back, `?` help.
+  The editor takes multi-line text; `ctrl+s` saves, `esc` cancels.
+
+## 4c. Headless CLI (`internal/cli`)
+
+`lazyplaner <command>` runs without the TUI and prints JSON; no arguments opens
+the TUI. Commands: `status`, `tree`, `set-tree`, `set-directives`, `complete`,
+`add-plan`, `add-note` (see README). They call the same code as the TUI through
+`internal/game` (plan XP, rust, tree and directive import), so an external
+agent's content goes through the same rules:
+
+- `set-tree` takes exactly 8 nodes in learning order (`rpg.ShapeExternalTree`)
+  and wires them into the fixed 2→3→2→1 shape with the usual required levels and
+  XP costs. `--replace` swaps an existing skill's nodes (`db.ReplaceSkillNodes`):
+  XP and history are kept and the tree is fitted to the skill's current level.
+  `--goal` is echoed back, not stored.
+- `set-directives` takes `{tier, node_id, title, description, difficulty?,
+  minutes?}`. Nodes must be OPEN or RUSTY on an active skill; tiers must form a
+  set (`rpg.CheckDaySet`: recon + 1-2 core_op + deep_push, or 1-2 recovery);
+  difficulty and minutes are clamped to the tier and XP comes from `rpg.Award`.
+  `--replace` swaps a set none of which is done (`db.ReplaceDaySet`).
+- Output is JSON on stdout; failures are `{"ok": false, "error": ...}` with exit
+  code 1, or 2 for usage errors.
+- The store opens SQLite with `journal_mode=WAL`, `busy_timeout=5000`,
+  `synchronous=NORMAL` and immediate transactions, so the TUI and CLI can write
+  at the same time.
+- `apply-blueprint` (`game.ApplyBlueprint` → `db.ApplyBlueprint`) saves a
+  skill, its 8-node tree, 2-4 curated tasks per node and a master plan (into
+  `plans`, no XP) in one transaction. Unknown JSON fields are refused.
+  `set-tree` nodes may carry `tasks` too.
+- `SKILL.md` (repo root) is the agent guide.
+
+### Curated task queue (`node_tasks`)
+
+- Each node can hold 2-4 tasks from an agent, done in `position` order; titles
+  are cleaned like directive titles, difficulty held to 1-5 and minutes to 5-120.
+- **Queue first:** generating the day's set (`g`) and a node's focus directive
+  (`g` on the tree) take, per slot, the next unfinished task of an open/rusty
+  node of the slot's skill (`rpg.FillFromQueue`: rusty nodes first, then the
+  task whose length best fits the tier). A curated directive keeps the task's
+  own difficulty and minutes (XP by `rpg.Award`) and links to it through
+  `challenges.node_task_id`; a task is never handed out twice in a day.
+- **Local model second:** only slots the queue cannot fill go to the model
+  (`game.BuildDay`). With no model, a set is still built from the queue, with
+  the unfilled slots left out and the status line saying so.
+- Completing a linked directive sets `node_tasks.is_completed`, so the node's
+  next task comes up.
+- **Recovery day:** a recovery slot eases into the next task (difficulty 1,
+  15 minutes, "Recovery pace" description) without linking it, so the task stays
+  next in the queue. This is done in code, not by the model.
+- Replacing a skill's tree deletes its queue.
+
 ## 5. Help (`h` / `?`)
 
 In-app help popup with tabs (←/→ to switch): **Skills** (what names are
@@ -238,6 +326,7 @@ screen and returns to it.
 | `c`        | Character sheet and XP history  |
 | `t`        | Skill tree map                  |
 | `g`        | Today's directives / bonus      |
+| `n`        | Notes                           |
 | `s`        | Character setup                 |
 | `h` / `?`  | Help                            |
 | `tab`      | Home: switch Directives / Plans |
@@ -259,6 +348,7 @@ internal/db/            SQLite store
   tree.go               Skill nodes, trees, UpdateSkill (rename + reset)
   challenges.go         Daily directives, reroll, bonus cap, completion, stats, streak
   settings.go           Key/value settings
+  notes.go              Notes CRUD, analysis, XP claim, shielded days, day logs
   rust.go               Rust and stance setters, last-practiced backfill
 internal/llm/           Ollama client
   client.go             ListModels, GenerateDescription (markdown)
@@ -274,6 +364,9 @@ internal/rpg/           Game rules, independent of UI and DB
   directives.go         Tiers, DailySlots, BuildDirectives (daily set, reroll, bonus)
   skillname.go          Skill-name validation and capitalization
   category.go           CategorizeSkill (small model) with a keyword fallback
+  notes.go              AnalyzeNote (status, shield, claimable work, follow-up), signifiers
+internal/game/          Actions shared by the TUI and CLI: plan XP, rust, tree and directive import
+internal/cli/           Headless JSON subcommands
 internal/ui/            Bubble Tea interface
   model.go / messages.go / keys.go / commands.go   state, async messages, input, tea.Cmd wrappers
   view.go / layout.go / panel.go / styles.go / overlay.go   rendering
@@ -282,6 +375,7 @@ internal/ui/            Bubble Tea interface
   character.go, tree.go, canvas.go   character sheet, tree map, drawing canvas
   daily.go                 today's directives: generate, reroll, bonus, complete
   help.go                  help popup
+  notes.go                 field log: list, analysis, day snapshot, claim, to plan, editor
 ```
 
 **Data flow:** `Update` handles a key/message and returns a `tea.Cmd` → commands
@@ -300,8 +394,10 @@ come from deterministic Go formulas. The `rpg` package depends on a small
 | `skills`      | id, name (unique, NOCASE), category, total_xp, is_active (stance), last_practiced_at (RFC 3339 text)                       |
 | `skill_nodes` | id, skill_id, parent_id (0 = skill root), name, description, required_level, xp_needed, progress, is_rusty; unique per (skill, name) |
 | `xp_events`   | id, skill_id, plan_id (no FK — history outlives plans), node_id, activity, difficulty, minutes, xp, created_at             |
-| `challenges`  | id, day (local YYYY-MM-DD), batch, skill_id, node_id, title, description, difficulty, minutes, xp, done_at                 |
+| `challenges`  | id, day (local YYYY-MM-DD), batch, skill_id, node_id, title, description, difficulty, minutes, xp, done_at, node_task_id   |
 | `settings`    | key/value (e.g. daily set size)                                                                                            |
+| `node_tasks`  | id, skill_id, node_id, position, title, description, difficulty, minutes, is_completed                                    |
+| `notes`       | id, body, created_at (the note's date), updated_at, status ('' until analyzed), shield, skill_name, minutes, follow_up, xp_event_id, claimed_xp |
 
 Schema is created with `CREATE TABLE IF NOT EXISTS`; later columns are added by
 `addColumnIfMissing` for databases from older versions.
